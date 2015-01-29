@@ -4,10 +4,10 @@ static char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012
 
 int strgen(char* buffer, size_t buflen) {
 
-
+    int charsetsize = (int)(sizeof(charset) -1);
     if (buffer) {            
         for (int n = 0;n < buflen;n++) {            
-             int key = rand() % (int)(sizeof(charset) -1);
+             int key = rand() % charsetsize;
              buffer[n] = charset[key];
             }
 
