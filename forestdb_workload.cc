@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <pthread.h>
+#include <queue>
 #include "iniparser.h"
 
 //static fdb_kvs_handle *snapshot[5];
@@ -19,7 +20,8 @@ static int max_reads;
 static int max_itr_reads;
 static int num_snaps_opened;
 static int wbatch_size;
-static int indexbuilddone; 
+static int indexbuilddone;
+static std::queue<std::pair<void *,size_t> > deleteQueue_kvs1, deleteQueue_kvs2; 
 static fdb_commit_opt_t FDB_COMMIT;
 
 int lockmemory(int buffercachesizeMB)
@@ -123,6 +125,55 @@ int init_fdb_with_kvs(fdb_kvs_config* kvs_list [], size_t num_kvs)
     return arg;
 }*/
 
+void *do_deletes(void *arg)
+{
+
+    sleep(60);
+    fdb_file_handle *fhandle;
+    fdb_kvs_handle *kvhandle1;
+    fdb_kvs_handle *kvhandle2;
+    fdb_config config;
+    fdb_kvs_config kvs_config;
+    fdb_status status;
+    fdb_doc *doc1, *doc2;
+    
+    config = fdb_get_default_config();
+    kvs_config = fdb_get_default_kvs_config();
+
+    status = fdb_open(&fhandle, "data/secondaryDB", &config);
+    assert(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_kvs_open(fhandle, &kvhandle1,"kvstore1" , &kvs_config);
+    assert(status == FDB_RESULT_SUCCESS);
+
+    status = fdb_kvs_open(fhandle, &kvhandle2,"kvstore2" , &kvs_config);
+    assert(status == FDB_RESULT_SUCCESS);
+    
+    while(!indexbuilddone)
+    {
+        if(!deleteQueue_kvs1.empty()){
+            std::pair<void *,size_t> doc1pair = deleteQueue_kvs1.front();   
+            status = FDB_RESULT_SUCCESS;
+            status = fdb_doc_create(&doc1, (const void *)doc1pair.first,
+                                    doc1pair.second, NULL, 0, NULL, 0);
+            status = fdb_del(kvhandle1, doc1);
+            deleteQueue_kvs1.pop(); //remove this item from delete queue
+            free(doc1pair.first);   //free up the buffer memory
+        }  
+        if(!deleteQueue_kvs2.empty()){
+            std::pair<void *,size_t> doc2pair = deleteQueue_kvs2.front();   
+            status = FDB_RESULT_SUCCESS;
+            status = fdb_doc_create(&doc2, (const void *)doc2pair.first,
+                                    doc2pair.second, NULL, 0, NULL, 0);
+            status = fdb_del(kvhandle2, doc2);
+            deleteQueue_kvs2.pop(); //remove this item from delete queue
+            free(doc2pair.first);   //free up the buffer memory
+        }  
+    
+    }
+
+}
+
 void *do_writes(void *arg)
 {
 
@@ -135,12 +186,12 @@ void *do_writes(void *arg)
     //std::vector<fdb_doc *> kvs1_deletelist, kvs2_deletelist;
     fdb_status status;
     size_t keylen;
-    char *keybuf1, *keybuf2;
+    char *keybuf1, *keybuf2, *delbuf1, *delbuf2;
     clock_t start;
     int deldoccounter; //use the counter to capture every nth key into delete list
     int commitflag;    //to reset the flag after every delete
     struct timeval index_starttime, index_stoptime;
-    numdocswritten = 0; 
+    int randdist = 0;
     config = fdb_get_default_config();
     config.durability_opt = FDB_DRB_ASYNC;
     kvs_config = fdb_get_default_kvs_config();
@@ -167,10 +218,18 @@ void *do_writes(void *arg)
     //start commit clock
     start = clock();
     gettimeofday(&index_starttime, NULL);
+    deldoccounter = 0;
+    numdocswritten = 0; 
     while(numdocswritten<numdocs){
        
        //generate the random key length
-       keylen = rand()%4000+64; 
+       randdist++;
+       if(randdist%4!=0) keylen = rand()%548+64;
+       else if(randdist%4==0) 
+       {
+          keylen = rand()%2000+2000; 
+          randdist = 0;
+       }
        strgen(keybuf1, keylen); 
        strgen(keybuf2, keylen);
        
@@ -190,6 +249,18 @@ void *do_writes(void *arg)
           status = fdb_set(kvhandle2, doc2);
        } while(status!=FDB_RESULT_SUCCESS); 
        numdocswritten++;
+       deldoccounter++;
+       
+       if(deldoccounter == 5)
+       {
+          delbuf1 = (char *)malloc(sizeof(char)*keylen);
+          delbuf2 = (char *)malloc(sizeof(char)*keylen);
+          memcpy(delbuf1, keybuf1, keylen);
+          memcpy(delbuf2, keybuf2, keylen);
+          deleteQueue_kvs1.push(std::make_pair(delbuf1,keylen));   
+          deleteQueue_kvs2.push(std::make_pair(delbuf2,keylen));   
+          deldoccounter = 0;
+       } 
        memset((void *)keybuf1, 0, sizeof(char)*keylen);
        memset((void *)keybuf2, 0, sizeof(char)*keylen);
         
@@ -209,9 +280,11 @@ void *do_writes(void *arg)
 
     gettimeofday(&index_stoptime, NULL);
     indexbuilddone = true;
-    fprintf(resultfile, "\nindex build time: %d seconds\n", (index_stoptime.tv_sec-index_starttime.tv_sec));
-    printf("\nnumdocs written: %lu \nindex build time: %d seconds\n", numdocswritten,
-                                    (index_stoptime.tv_sec-index_starttime.tv_sec)); 
+    fprintf(resultfile, "\nindex build time: %d seconds\n", 
+                           (index_stoptime.tv_sec-index_starttime.tv_sec));
+    printf("\nnumdocs written: %lu \nindex build time: %d seconds\n", 
+              numdocswritten,(index_stoptime.tv_sec-index_starttime.tv_sec));
+    printf("\ndelete queue size: %lu\n", deleteQueue_kvs1.size()+deleteQueue_kvs2.size()); 
     free(keybuf1);
     free(keybuf2);
     fdb_doc_free(doc1);  
@@ -287,9 +360,9 @@ void *do_reads(void *arg)
 
 int do_load(int num_wthreads, int num_rthreads)
 {
-
-   pthread_t bench_thread[num_wthreads+num_rthreads];
-   int *arg[num_wthreads+num_rthreads];
+   int num_delthreads = 1;
+   pthread_t bench_thread[num_wthreads+num_rthreads+num_delthreads];
+   int *arg[num_wthreads+num_rthreads+num_delthreads];
    
    //spawn writer threads
    for (int i=0; i<num_wthreads; i++){
@@ -307,11 +380,20 @@ int do_load(int num_wthreads, int num_rthreads)
        arg[num_wthreads+i] = (int *)malloc(sizeof(int));
        *arg[num_wthreads+i] = i;
        printf("\nspawning reader thread id: %d", *arg[num_wthreads+i]); 
-       pthread_create(&bench_thread[num_wthreads+i],NULL, do_reads, (void *)arg[num_wthreads+i]);                
+       pthread_create(&bench_thread[num_wthreads+i],NULL, do_reads, 
+                      (void *)arg[num_wthreads+i]);                
+   }
+   
+   for (int i=0; i<num_delthreads; i++){
+       arg[num_wthreads+num_rthreads+i] = (int *)malloc(sizeof(int));
+       *arg[num_wthreads+num_rthreads+i] = i;
+       printf("\nspawning delete thread id: %d", *arg[num_wthreads+num_rthreads+i]); 
+       pthread_create(&bench_thread[num_wthreads+num_rthreads+i],NULL, do_deletes, 
+                      (void *)arg[num_wthreads+num_rthreads+i]);                
    }
 
 
-   for (int i = 0; i<num_wthreads+num_rthreads; i++){
+   for (int i = 0; i<num_wthreads+num_rthreads+num_delthreads; i++){
        pthread_join(bench_thread[i],NULL);
    }
    return true;
