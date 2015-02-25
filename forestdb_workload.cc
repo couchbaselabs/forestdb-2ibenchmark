@@ -83,7 +83,7 @@ int init_fdb_with_kvs(fdb_kvs_config* kvs_list [], size_t num_kvs)
     config = fdb_get_default_config();
     config.durability_opt = FDB_DRB_ASYNC;
     config.compaction_mode = FDB_COMPACTION_MANUAL;
-    config.buffercache_size = buffercachesizeMB*1024*1024;  //1GB
+    config.buffercache_size = (uint64_t)buffercachesizeMB*1024*1024;  //1GB
     //config.num_wal_partitions = 8;
     kvs_config = fdb_get_default_kvs_config();
 
