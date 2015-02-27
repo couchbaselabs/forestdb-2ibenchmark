@@ -95,7 +95,10 @@ int init_fdb_with_kvs(fdb_kvs_config* kvs_list [], size_t num_kvs)
 
     status = fdb_kvs_open(fhandle, &kvhandle2,"kvstore2" , &kvs_config);
     assert(status == FDB_RESULT_SUCCESS);
-    
+   
+    fdb_kvs_close(kvhandle1); 
+    fdb_kvs_close(kvhandle2); 
+    fdb_close(fhandle); 
     return true;
 }
 
@@ -146,8 +149,12 @@ void *do_deletes(void *arg)
         }  
     
     }
-
+    fdb_kvs_close(kvhandle1); 
+    fdb_kvs_close(kvhandle2); 
+    fdb_close(fhandle); 
+    return arg;
 }
+
 
 void *do_writes(void *arg)
 {
@@ -205,17 +212,13 @@ void *do_writes(void *arg)
           keylen = rand()%2000+2000; 
           randdist = 0;
        }
-       strgen(keybuf1, keylen); 
-       strgen(keybuf2, keylen);
        
        //reuse the fdb_doc structure created above to insert new KV pairs 
-       memset(doc1->key, 0, sizeof(char)*keylen);
-       memcpy(doc1->key, keybuf1, keylen);
+       strgen((char *)doc1->key, keylen); 
        doc1->keylen = keylen;
-       memset(doc2->key, 0, sizeof(char)*keylen);
-       memcpy(doc2->key, keybuf2, keylen);
+       strgen((char *)doc2->key, keylen);
        doc2->keylen = keylen;
-      
+       
        do{
            status = fdb_set(kvhandle1, doc1);
        } while(status!=FDB_RESULT_SUCCESS); 
@@ -230,14 +233,12 @@ void *do_writes(void *arg)
        {
           delbuf1 = (char *)malloc(sizeof(char)*keylen);
           delbuf2 = (char *)malloc(sizeof(char)*keylen);
-          memcpy(delbuf1, keybuf1, keylen);
-          memcpy(delbuf2, keybuf2, keylen);
+          memcpy(delbuf1, doc1->key, keylen);
+          memcpy(delbuf2, doc2->key, keylen);
           deleteQueue_kvs1.push(std::make_pair(delbuf1,keylen));   
           deleteQueue_kvs2.push(std::make_pair(delbuf2,keylen));   
           deldoccounter = 0;
        } 
-       memset((void *)keybuf1, 0, sizeof(char)*keylen);
-       memset((void *)keybuf2, 0, sizeof(char)*keylen);
         
        //every 60 seconds,  call commit
        if(((clock()-start)/(double) CLOCKS_PER_SEC)>60){
@@ -246,12 +247,8 @@ void *do_writes(void *arg)
        }
     }
     
-    //opening new handle for final commit - not really needed
-    fdb_file_handle *fhandle_2;
-    config = fdb_get_default_config();
-    status = fdb_open(&fhandle_2, "data/secondaryDB", &config);
-    assert(status == FDB_RESULT_SUCCESS);
-    status = fdb_commit(fhandle_2, FDB_COMMIT_MANUAL_WAL_FLUSH);
+    //final commit
+    status = fdb_commit(fhandle, FDB_COMMIT_MANUAL_WAL_FLUSH);
 
     gettimeofday(&index_stoptime, NULL);
     indexbuilddone = true;
@@ -264,8 +261,9 @@ void *do_writes(void *arg)
     free(keybuf2);
     fdb_doc_free(doc1);  
     fdb_doc_free(doc2);
+    fdb_kvs_close(kvhandle1); 
+    fdb_kvs_close(kvhandle2); 
     fdb_close(fhandle);  
-    fdb_close(fhandle_2);  
     return arg;
 }
 
@@ -331,15 +329,11 @@ void *do_incremental_writes(void *arg)
           keylen = rand()%2000+2000; 
           randdist = 0;
        }
-       strgen(keybuf1, keylen); 
-       strgen(keybuf2, keylen);
+       strgen((char *)doc1->key, keylen); 
+       strgen((char *)doc2->key, keylen);
        
        //reuse the fdb_doc structure created above to insert new KV pairs 
-       memset(doc1->key, 0, sizeof(char)*keylen);
-       memcpy(doc1->key, keybuf1, keylen);
        doc1->keylen = keylen;
-       memset(doc2->key, 0, sizeof(char)*keylen);
-       memcpy(doc2->key, keybuf2, keylen);
        doc2->keylen = keylen;
       
        do{
@@ -352,9 +346,6 @@ void *do_incremental_writes(void *arg)
        numincrmutationsdone++;
        deldoccounter++;
        
-       memset((void *)keybuf1, 0, sizeof(char)*keylen);
-       memset((void *)keybuf2, 0, sizeof(char)*keylen);
-        
        //every 60 seconds,  call commit
        if(((clock()-start)/(double) CLOCKS_PER_SEC)>60){
           status = fdb_commit(fhandle, FDB_COMMIT);
@@ -377,6 +368,8 @@ void *do_incremental_writes(void *arg)
     fdb_doc_free(doc2);  
     //wait for compactor thread to terminate
     pthread_join(compactor_thread,NULL);
+    fdb_kvs_close(kvhandle1); 
+    fdb_kvs_close(kvhandle2); 
     fdb_close(fhandle);  
     free(argcompact);
     return arg;
@@ -427,7 +420,7 @@ void *do_reads(void *arg)
    assert(status == FDB_RESULT_SUCCESS);
    gettimeofday(&read_starttime, NULL);
    while(!incrindexbuilddone){ 
-      if(numreads<0.5*numincrmutationsdone)
+      if(numreads<(numincrmutationsdone/num_rthreads))
       {  
          //always open in-memory snapshots if there are writes between COMMIT
          //and snapshot_open
@@ -453,13 +446,17 @@ void *do_reads(void *arg)
          }   
          fdb_iterator_close(itr_kv);
          status = fdb_kvs_close(snapshot);
-         //usleep(300000);
        }
    } 
    gettimeofday(&read_stoptime, NULL); 
    free(keybuf);
    fdb_doc_free(doc);  
-   printf("\nreader thread id: %d num snapshots opened: %lu num of reads done: %lu", tid,num_opened_snapshots, numreads); 
+   fdb_kvs_close(kvhandle); 
+   fdb_close(fhandle); 
+   printf("\nreader thread id: %d num snapshots opened: %lu num of reads done: %lu", 
+                                                             tid,num_opened_snapshots, numreads); 
+   fprintf(resultfile,"\nreader thread id: %d num snapshots opened: %lu num of reads done: %lu", 
+                                                             tid,num_opened_snapshots, numreads); 
    return arg;
 }
 
@@ -479,6 +476,7 @@ void *compactor(void *arg)
        status = fdb_compact(fhandle, NULL);//manual compaction every 60 seconds
        sleep(60);
     }
+    fdb_close(fhandle);
     return arg;
 }
 
@@ -534,7 +532,6 @@ int do_incremental_load(int num_wthreads, int num_rthreads)
        pthread_create(&bench_thread[i],NULL, do_incremental_writes, (void *)arg[i]);                
    }
    
-   
    //spawn reader threads
    for (int i=0; i<num_rthreads; i++){
        arg[num_wthreads+i] = (int *)malloc(sizeof(int));
@@ -544,10 +541,11 @@ int do_incremental_load(int num_wthreads, int num_rthreads)
                       (void *)arg[num_wthreads+i]);                
    }
    
-   
    for (int i = 0; i<num_wthreads+num_rthreads; i++){
        pthread_join(bench_thread[i],NULL);
+       free(arg[i]);
    }
+   
    return true;
 }
 
