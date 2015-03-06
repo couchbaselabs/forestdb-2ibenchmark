@@ -11,6 +11,9 @@
 #include <dirent.h>
 #include "iniparser.h"
 
+#define SEQ   1
+#define RANGE 2
+
 //static fdb_kvs_handle *snapshot[5];
 static FILE *resultfile;
 static int numinitdocs;
@@ -18,7 +21,9 @@ static int numinitdocswritten;
 static int numincrmutations;
 static int numincrmutationsdone;
 static int buffercachesizeMB;
+static bool num_wthreads;
 static int num_rthreads;
+static int read_pattern;
 static int max_itr_reads;
 static int num_snaps_opened;
 static int wbatch_size;
@@ -312,7 +317,7 @@ void *do_incremental_writes(void *arg)
     //spawn compactor thread
     argcompact = (int *)malloc(sizeof(int));
     *argcompact = 0;
-    pthread_create(&compactor_thread, NULL, compactor, (void *)argcompact);   
+    //pthread_create(&compactor_thread, NULL, compactor, (void *)argcompact);   
      
     //start commit clock
     start = clock();
@@ -367,7 +372,7 @@ void *do_incremental_writes(void *arg)
     fdb_doc_free(doc1);  
     fdb_doc_free(doc2);  
     //wait for compactor thread to terminate
-    pthread_join(compactor_thread,NULL);
+    //pthread_join(compactor_thread,NULL);
     fdb_kvs_close(kvhandle1); 
     fdb_kvs_close(kvhandle2); 
     fdb_close(fhandle);  
@@ -394,6 +399,8 @@ void *do_reads(void *arg)
    unsigned long numreads = 0;
    unsigned long num_opened_snapshots = 0;
    int tid = *(int *)arg;
+   void *startkey;
+   int startkeylen;
    printf("\nstarting reader thread id: %d", tid); 
    
    config = fdb_get_default_config();
@@ -418,9 +425,11 @@ void *do_reads(void *arg)
    status = fdb_doc_create(&doc, (const void *)keybuf, keylen, 
                                NULL, 0, NULL, 0);
    assert(status == FDB_RESULT_SUCCESS);
+   startkey = NULL;
+   startkeylen = 0;
    gettimeofday(&read_starttime, NULL);
    while(!incrindexbuilddone){ 
-      if(numreads<(numincrmutationsdone/num_rthreads))
+      if(read_pattern==SEQ && ((numreads<(numincrmutationsdone/num_rthreads))|| !num_wthreads))
       {  
          //always open in-memory snapshots if there are writes between COMMIT
          //and snapshot_open
@@ -430,7 +439,42 @@ void *do_reads(void *arg)
          num_opened_snapshots++; 
          do{
             status = fdb_iterator_init(snapshot, &itr_kv,
-                                       NULL, 0, NULL, 0,
+                                       startkey, startkeylen, NULL, 0,
+                                       FDB_ITR_NONE);
+         } while(status != FDB_RESULT_SUCCESS); 
+      
+         itr_reads = 0; 
+         while(fdb_iterator_next(itr_kv) != FDB_RESULT_ITERATOR_FAIL){
+            status = fdb_iterator_get(itr_kv, &doc);
+            assert (status == FDB_RESULT_SUCCESS);
+            numreads++;
+            itr_reads++;
+            if(itr_reads>max_itr_reads){
+               startkey = doc->key;
+               startkeylen = doc->keylen;
+               break;
+            }  
+         }   
+         fdb_iterator_close(itr_kv);
+         status = fdb_kvs_close(snapshot);
+      if(numreads>=(numincrmutations-10))//exit criteria for read only case
+         goto readstats;
+      }
+      else if(read_pattern==RANGE && ((numreads<(numincrmutationsdone/num_rthreads))|| !num_wthreads))
+      {
+         startkey = malloc(5*sizeof(char));//generate random start keys of length 5 chars
+         startkeylen = 5;
+         max_itr_reads = rand()%4000+1000; 
+         strgen((char *)startkey, startkeylen); 
+         //always open in-memory snapshots if there are writes between COMMIT
+         //and snapshot_open
+         do{
+            status = fdb_snapshot_open(kvhandle, &snapshot, FDB_SNAPSHOT_INMEM);
+         }while(status != FDB_RESULT_SUCCESS);
+         num_opened_snapshots++; 
+         do{
+            status = fdb_iterator_init(snapshot, &itr_kv,
+                                       startkey, startkeylen, NULL, 0,
                                        FDB_ITR_NONE);
          } while(status != FDB_RESULT_SUCCESS); 
       
@@ -446,8 +490,11 @@ void *do_reads(void *arg)
          }   
          fdb_iterator_close(itr_kv);
          status = fdb_kvs_close(snapshot);
-       }
+      if(numreads>=(numincrmutations-10))//exit criteria for read only case
+         goto readstats;
+     }
    } 
+readstats:   
    gettimeofday(&read_stoptime, NULL); 
    free(keybuf);
    fdb_doc_free(doc);  
@@ -455,8 +502,9 @@ void *do_reads(void *arg)
    fdb_close(fhandle); 
    printf("\nreader thread id: %d num snapshots opened: %lu num of reads done: %lu", 
                                                              tid,num_opened_snapshots, numreads); 
-   fprintf(resultfile,"\nreader thread id: %d num snapshots opened: %lu num of reads done: %lu", 
-                                                             tid,num_opened_snapshots, numreads); 
+   fprintf(resultfile,"\nreader thread id: %d num snapshots opened: %lu num of reads done: %lu"
+                                "time elapsed for reads:%d",tid,num_opened_snapshots, numreads,
+                                                  (read_stoptime.tv_sec-read_starttime.tv_sec)); 
    return arg;
 }
 
@@ -560,7 +608,9 @@ int main(int argc, char* args[])
     numinitdocs = iniparser_getint(cfg, (char*)"document:numinitdocs", 10000);
     numincrmutations = iniparser_getint(cfg, (char*)"document:numincrmutations", 10000);
     buffercachesizeMB = iniparser_getint(cfg, (char*)"db_config:buffercachesizeMB", 1024);
+    num_wthreads = iniparser_getint(cfg, (char*)"threads:writers", 1);
     num_rthreads = iniparser_getint(cfg, (char*)"threads:readers", 4);
+    read_pattern = iniparser_getint(cfg, (char*)"workload_pattern:read_pattern", 2);
     wbatch_size = iniparser_getint(cfg, (char*)"batchparams:wbatch_size", 100);
     max_itr_reads = iniparser_getint(cfg, (char*)"batchparams:maxreads_per_iterator", 1000000);
     const char *resultfilename = (const char*)iniparser_getstring(cfg, (char*)"result_file:resultfilename", 
@@ -578,7 +628,8 @@ int main(int argc, char* args[])
     fprintf(resultfile, "\nnumber of documents: %d", numinitdocs);
     fprintf(resultfile, "\nbuffer cache size: %d MB", buffercachesizeMB);
     fprintf(resultfile, "\nwrite batch size: %d", wbatch_size);
-    fprintf(resultfile, "\nnumber of reader threads: %d", num_rthreads);
+    fprintf(resultfile, "\nnumber of incremental writer threads: %d", num_wthreads);
+    fprintf(resultfile, "\nnumber of incremental reader threads: %d", num_rthreads);
     fprintf(resultfile, "\ncommit type: %s", committype);
     //initialize DB and KV instances
     init_fdb_with_kvs(NULL,2);
@@ -592,7 +643,7 @@ int main(int argc, char* args[])
                                                              "data/secondaryDB")/(1024*1024*1024));
     if(testtype[0]=='o'||testtype[0]=='O')
     {
-       do_incremental_load(1,num_rthreads); //incremental load always uses 1 writer
+       do_incremental_load(num_wthreads, num_rthreads); //incremental load always uses 1 writer
     }
     fprintf(resultfile, "\nfinal database file size: %.2f GB", (double)get_filesize(
                                                              "data/secondaryDB")/(1024*1024*1024));
