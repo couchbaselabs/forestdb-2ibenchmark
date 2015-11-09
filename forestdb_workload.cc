@@ -1,664 +1,235 @@
-#include "forestdb_workload.h"
-#include "strgen.h"
+#include <assert.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <stdio.h>
-#include <sys/time.h>
-#include <sys/stat.h>
-#include <sys/sysinfo.h>
 #include <pthread.h>
-#include <queue>
-#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
+
+#include "libforestdb/forestdb.h"
 #include "iniparser.h"
+#include "strgen.h"
+#include "xxhash.h"
 
-#define SEQ   1
-#define RANGE 2
-
-//static fdb_kvs_handle *snapshot[5];
-static FILE *resultfile;
+// from config
 static int numinitdocs;
-static int numinitdocswritten;
-static int numincrmutations;
-static int numincrmutationsdone;
+static int numincrdocs;
+static int read_batch;
+static int lock_prob;
 static int buffercachesizeMB;
-static bool num_wthreads;
-static int num_rthreads;
-static int read_pattern;
-static int max_itr_reads;
-static int num_snaps_opened;
-static int wbatch_size;
-static int indexbuilddone;
-static int incrindexbuilddone;
-static std::queue<std::pair<void *,size_t> > deleteQueue_kvs1, deleteQueue_kvs2; 
-static fdb_commit_opt_t FDB_COMMIT;
-//foreward declaration of compactor
-void *compactor(void *arg);
+static fdb_commit_opt_t FDB_COMMIT = FDB_COMMIT_MANUAL_WAL_FLUSH;
 
-int lockmemory(int buffercachesizeMB)
-{
-   struct sysinfo mysysinfo;
-   unsigned long lockmem, mem_locked;
-   unsigned long buf_cachesiz;
-   void *mem;
-   int status = sysinfo(&mysysinfo);
-   assert(status == 0);
-   buf_cachesiz = buffercachesizeMB*1024*1024;
-   lockmem = mysysinfo.totalram - 0.2*mysysinfo.totalram - buf_cachesiz;
-   mem_locked = 0;
-   while(mem_locked<lockmem)
-   {
-        mem = malloc(4096);//4 KB at a time
-        mem_locked = mem_locked + 4096;
-   }
-   return lockmem;    
+// general
+FILE * resultfile;
+static bool incr_index_build_done = false;
+// This has to be 20. Some hardcoding logic. See fill_key.
+const size_t docid_len = 20;
+const size_t field_value_len = 50;
+
+// control points
+static bool indexbuilddone = false;
+static bool incrindexbuilddone = false;
+
+void fill_key(char* buffer, unsigned long long marker){
+    //hash the marker and fill the result into buffer.
+    const char *prefix = "secidx";
+    sprintf(buffer, "%s", prefix);
+    sprintf(buffer+6, "%014d", XXH64(&marker, sizeof(marker), 1));
 }
 
-uint64_t get_filesize(const char *filename)
+int init_fdb_with_kvs()
 {
-    struct stat filestat;
-    stat(filename, &filestat);
-    return filestat.st_size;
-}
-
-fdb_status fdb_doc_new(fdb_doc **doc, const void *key, size_t keylen,
-                       const void *meta, size_t metalen,
-                       const void *body, size_t bodylen)
-{
-     memset((*doc)->key, 0, sizeof(char)*keylen);
-     memcpy((*doc)->key, key, keylen);
-     (*doc)->keylen = keylen;
-     (*doc)->meta = NULL;
-     (*doc)->metalen = 0;
-     (*doc)->body = NULL;
-     (*doc)->bodylen = 0;
-
-}
-
-int init_fdb_with_kvs(fdb_kvs_config* kvs_list [], size_t num_kvs)
-{
-
     fdb_file_handle *fhandle;
-    fdb_kvs_handle *kvhandle1;
-    fdb_kvs_handle *kvhandle2;
-    fdb_status status;
+    fdb_kvs_handle *main_handle;
+    fdb_kvs_handle *back_handle;
     fdb_config config;
     fdb_kvs_config kvs_config;
-    fdb_seqnum_t seqnum;
+    fdb_status status;
 
     config = fdb_get_default_config();
+    config.max_writer_lock_prob = lock_prob;
     config.durability_opt = FDB_DRB_ASYNC;
     config.compaction_mode = FDB_COMPACTION_MANUAL;
     config.buffercache_size = (uint64_t)buffercachesizeMB*1024*1024;  //1GB
-    //config.num_wal_partitions = 8;
     kvs_config = fdb_get_default_kvs_config();
 
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
     assert(status == FDB_RESULT_SUCCESS);
 
-    status = fdb_kvs_open(fhandle, &kvhandle1,"kvstore1" , &kvs_config);
+    status = fdb_kvs_open(fhandle, &main_handle,"main" , &kvs_config);
     assert(status == FDB_RESULT_SUCCESS);
 
-    status = fdb_kvs_open(fhandle, &kvhandle2,"kvstore2" , &kvs_config);
+    status = fdb_kvs_open(fhandle, &back_handle,"back" , &kvs_config);
     assert(status == FDB_RESULT_SUCCESS);
-   
-    fdb_kvs_close(kvhandle1); 
-    fdb_kvs_close(kvhandle2); 
-    fdb_close(fhandle); 
+
+    fdb_kvs_close(main_handle);
+    fdb_kvs_close(back_handle);
+    fdb_close(fhandle);
     return true;
 }
 
-
-void *do_deletes(void *arg)
+void * do_initial_write(void*)
 {
-
-    sleep(60);
     fdb_file_handle *fhandle;
-    fdb_kvs_handle *kvhandle1;
-    fdb_kvs_handle *kvhandle2;
+    fdb_kvs_handle *main_handle;
+    fdb_kvs_handle *back_handle;
     fdb_config config;
     fdb_kvs_config kvs_config;
+    fdb_doc *main_doc, *back_doc;
     fdb_status status;
-    fdb_doc *doc1, *doc2;
-    
-    config = fdb_get_default_config();
-    kvs_config = fdb_get_default_kvs_config();
-
-    status = fdb_open(&fhandle, "data/secondaryDB", &config);
-    assert(status == FDB_RESULT_SUCCESS);
-
-    status = fdb_kvs_open(fhandle, &kvhandle1,"kvstore1" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
-
-    status = fdb_kvs_open(fhandle, &kvhandle2,"kvstore2" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
-    
-    while(!indexbuilddone)
-    {
-        if(!deleteQueue_kvs1.empty()){
-            std::pair<void *,size_t> doc1pair = deleteQueue_kvs1.front();   
-            status = FDB_RESULT_SUCCESS;
-            status = fdb_doc_create(&doc1, (const void *)doc1pair.first,
-                                    doc1pair.second, NULL, 0, NULL, 0);
-            status = fdb_del(kvhandle1, doc1);
-            deleteQueue_kvs1.pop(); //remove this item from delete queue
-            free(doc1pair.first);   //free up the buffer memory
-        }  
-        if(!deleteQueue_kvs2.empty()){
-            std::pair<void *,size_t> doc2pair = deleteQueue_kvs2.front();   
-            status = FDB_RESULT_SUCCESS;
-            status = fdb_doc_create(&doc2, (const void *)doc2pair.first,
-                                    doc2pair.second, NULL, 0, NULL, 0);
-            status = fdb_del(kvhandle2, doc2);
-            deleteQueue_kvs2.pop(); //remove this item from delete queue
-            free(doc2pair.first);   //free up the buffer memory
-        }  
-    
-    }
-    fdb_kvs_close(kvhandle1); 
-    fdb_kvs_close(kvhandle2); 
-    fdb_close(fhandle); 
-    return arg;
-}
-
-
-void *do_writes(void *arg)
-{
-
-    fdb_file_handle *fhandle;
-    fdb_kvs_handle *kvhandle1;
-    fdb_kvs_handle *kvhandle2;
-    fdb_config config;
-    fdb_kvs_config kvs_config;
-    fdb_doc *doc1, *doc2;
-    //std::vector<fdb_doc *> kvs1_deletelist, kvs2_deletelist;
-    fdb_status status;
-    size_t keylen;
-    char *keybuf1, *keybuf2, *delbuf1, *delbuf2;
-    clock_t start;
-    int deldoccounter; //use the counter to capture every nth key into delete list
-    int commitflag;    //to reset the flag after every delete
+    char * main_key_buf, *back_key_buf, *back_value_buf;
     struct timeval index_starttime, index_stoptime;
-    int randdist = 0;
+    clock_t commit_checkpoint;
+
     config = fdb_get_default_config();
+    config.max_writer_lock_prob = lock_prob;
     config.durability_opt = FDB_DRB_ASYNC;
+
     kvs_config = fdb_get_default_kvs_config();
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
     assert(status == FDB_RESULT_SUCCESS);
-    status = fdb_kvs_open(fhandle, &kvhandle1,"kvstore1" , &kvs_config);
+    status = fdb_kvs_open(fhandle, &main_handle,"main" , &kvs_config);
     assert(status == FDB_RESULT_SUCCESS);
-    status = fdb_kvs_open(fhandle, &kvhandle2,"kvstore2" , &kvs_config);
+    status = fdb_kvs_open(fhandle, &back_handle,"back" , &kvs_config);
     assert(status == FDB_RESULT_SUCCESS);
-    keylen = 4096; 
-    keybuf1 = (char *)malloc(sizeof(char)*keylen);
-    keybuf2 = (char *)malloc(sizeof(char)*keylen);
-    memset((void *)keybuf1, 0, sizeof(char)*keylen);
-    memset((void *)keybuf2, 0, sizeof(char)*keylen);
+
+    /*
+     * Main index is a covering index that concatenates field value and docid
+     * back index is a docid -> value mapping
+     * Initialize the buffers and docs for main and back indexes.
+     */
+    main_key_buf = (char *)malloc(sizeof(char) * (docid_len + field_value_len));
+    back_key_buf = (char *)malloc(sizeof(char) * docid_len);
+    back_value_buf = (char *)malloc(sizeof(char) * field_value_len);
+
+    memset((void *)main_key_buf, 0, sizeof(char) * (docid_len + field_value_len));
+    memset((void *)back_key_buf, 0, sizeof(char) * docid_len);
+    memset((void *)back_value_buf, 0, sizeof(char) * field_value_len);
 
     status = FDB_RESULT_SUCCESS;
-    status = fdb_doc_create(&doc1, (const void *)keybuf1, keylen, 
+    status = fdb_doc_create(&main_doc, (const void *)main_key_buf, (docid_len + field_value_len),
                                NULL, 0, NULL, 0);
     assert(status == FDB_RESULT_SUCCESS);
-    status = fdb_doc_create(&doc2, (const void *)keybuf2, keylen, 
-                               NULL, 0, NULL, 0);
+    status = fdb_doc_create(&back_doc, (const void *)back_key_buf, docid_len,
+                               NULL, 0, (const void *)back_value_buf, field_value_len);
     assert(status == FDB_RESULT_SUCCESS);
-    
+
     //start commit clock
-    start = clock();
+    commit_checkpoint = clock();
     gettimeofday(&index_starttime, NULL);
-    deldoccounter = 0;
-    numinitdocswritten = 0; 
+    int numinitdocswritten = 0;
+
     while(numinitdocswritten<numinitdocs){
-       
-       //generate the random key length
-       randdist++;
-       if(randdist%4!=0) keylen = rand()%548+64;
-       else if(randdist%4==0) 
-       {
-          keylen = rand()%2000+2000; 
-          randdist = 0;
-       }
-       
-       //reuse the fdb_doc structure created above to insert new KV pairs 
-       strgen((char *)doc1->key, keylen); 
-       doc1->keylen = keylen;
-       strgen((char *)doc2->key, keylen);
-       doc2->keylen = keylen;
-       
-       do{
-           status = fdb_set(kvhandle1, doc1);
-       } while(status!=FDB_RESULT_SUCCESS); 
-       numinitdocswritten++;
-       do{
-          status = fdb_set(kvhandle2, doc2);
-       } while(status!=FDB_RESULT_SUCCESS); 
-       numinitdocswritten++;
-       deldoccounter++;
-       
-       if(false) //shutting off deletes until needed
-       {
-          delbuf1 = (char *)malloc(sizeof(char)*keylen);
-          delbuf2 = (char *)malloc(sizeof(char)*keylen);
-          memcpy(delbuf1, doc1->key, keylen);
-          memcpy(delbuf2, doc2->key, keylen);
-          deleteQueue_kvs1.push(std::make_pair(delbuf1,keylen));   
-          deleteQueue_kvs2.push(std::make_pair(delbuf2,keylen));   
-          deldoccounter = 0;
-       } 
-        
-       //every 60 seconds,  call commit
-       if(((clock()-start)/(double) CLOCKS_PER_SEC)>60){
-          status = fdb_commit(fhandle, FDB_COMMIT);
-          start = clock();
-       }
+        // Populate doc for the back index. 
+        strgen((char *)back_doc->body, field_value_len);
+        back_doc->bodylen = field_value_len;
+        fill_key((char *)back_doc->key, numinitdocswritten);
+ 
+        // Populaate doc->key for main index using information from back_doc 
+        memcpy(main_doc->key, back_doc->body, field_value_len);
+        memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
+ 
+        do{
+            status = fdb_set(main_handle, main_doc);
+        } while(status!=FDB_RESULT_SUCCESS);
+        numinitdocswritten++;
+        do{
+           status = fdb_set(back_handle, back_doc);
+        } while(status!=FDB_RESULT_SUCCESS);
+        numinitdocswritten++;
+ 
+        // Every 300 seconds, call commit, during initial load phase
+        if(((clock() - commit_checkpoint)/(double) CLOCKS_PER_SEC) > 300){
+           status = fdb_commit(fhandle, FDB_COMMIT);
+           commit_checkpoint = clock();
+        }
     }
-    
+
     //final commit
     status = fdb_commit(fhandle, FDB_COMMIT_MANUAL_WAL_FLUSH);
 
     gettimeofday(&index_stoptime, NULL);
     indexbuilddone = true;
-    fprintf(resultfile, "\ninitial index build time: %d seconds\n", 
+    fprintf(resultfile, "\ninitial index build time: %d seconds\n",
                            (index_stoptime.tv_sec-index_starttime.tv_sec));
-    printf("\nnuminitdocs written: %lu \ninitial index build time: %d seconds\n", 
+    printf("\nnuminitdocs written: %lu \ninitial index build time: %d seconds\n",
               numinitdocswritten,(index_stoptime.tv_sec-index_starttime.tv_sec));
-    printf("\ndelete queue size: %lu\n", deleteQueue_kvs1.size()+deleteQueue_kvs2.size()); 
-    free(keybuf1);
-    free(keybuf2);
-    fdb_doc_free(doc1);  
-    fdb_doc_free(doc2);
-    fdb_kvs_close(kvhandle1); 
-    fdb_kvs_close(kvhandle2); 
-    fdb_close(fhandle);  
-    return arg;
-}
-
-void *do_incremental_writes(void *arg)
-{
-
-    fdb_file_handle *fhandle;
-    fdb_kvs_handle *kvhandle1;
-    fdb_kvs_handle *kvhandle2;
-    fdb_config config;
-    fdb_kvs_config kvs_config;
-    fdb_doc *doc1, *doc2;
-    //std::vector<fdb_doc *> kvs1_deletelist, kvs2_deletelist;
-    fdb_status status;
-    size_t keylen;
-    char *keybuf1, *keybuf2, *delbuf1, *delbuf2;
-    clock_t start;
-    int deldoccounter; //use the counter to capture every nth key into delete list
-    int commitflag;    //to reset the flag after every delete
-    struct timeval index_starttime, index_stoptime;
-    int *argcompact;
-    pthread_t compactor_thread;
-    int randdist = 0;
-    config = fdb_get_default_config();
-    config.durability_opt = FDB_DRB_ASYNC;
-    kvs_config = fdb_get_default_kvs_config();
-    status = fdb_open(&fhandle, "data/secondaryDB", &config);
-    assert(status == FDB_RESULT_SUCCESS);
-    status = fdb_kvs_open(fhandle, &kvhandle1,"kvstore1" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
-    status = fdb_kvs_open(fhandle, &kvhandle2,"kvstore2" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
-    keylen = 4096; 
-    keybuf1 = (char *)malloc(sizeof(char)*keylen);
-    keybuf2 = (char *)malloc(sizeof(char)*keylen);
-    memset((void *)keybuf1, 0, sizeof(char)*keylen);
-    memset((void *)keybuf2, 0, sizeof(char)*keylen);
-
-    status = FDB_RESULT_SUCCESS;
-    status = fdb_doc_create(&doc1, (const void *)keybuf1, keylen, 
-                               NULL, 0, NULL, 0);
-    assert(status == FDB_RESULT_SUCCESS);
-    status = fdb_doc_create(&doc2, (const void *)keybuf2, keylen, 
-                               NULL, 0, NULL, 0);
-    assert(status == FDB_RESULT_SUCCESS);
-    //spawn compactor thread
-    argcompact = (int *)malloc(sizeof(int));
-    *argcompact = 0;
-    pthread_create(&compactor_thread, NULL, compactor, (void *)argcompact);   
-     
-    //start commit clock
-    start = clock();
-    gettimeofday(&index_starttime, NULL);
-    deldoccounter = 0;
-    numincrmutationsdone = 0; 
-    while(numincrmutationsdone<numincrmutations){
-       
-       //generate the random key length
-       randdist++;
-       if(randdist%4!=0) keylen = rand()%548+64;
-       else if(randdist%4==0) 
-       {
-          keylen = rand()%2000+2000; 
-          randdist = 0;
-       }
-       strgen((char *)doc1->key, keylen); 
-       strgen((char *)doc2->key, keylen);
-       
-       //reuse the fdb_doc structure created above to insert new KV pairs 
-       doc1->keylen = keylen;
-       doc2->keylen = keylen;
-      
-       do{
-           status = fdb_set(kvhandle1, doc1);
-       } while(status!=FDB_RESULT_SUCCESS); 
-       numincrmutationsdone++;
-       do{
-          status = fdb_set(kvhandle2, doc2);
-       } while(status!=FDB_RESULT_SUCCESS); 
-       numincrmutationsdone++;
-       deldoccounter++;
-       
-       //every 60 seconds,  call commit
-       if(((clock()-start)/(double) CLOCKS_PER_SEC)>60){
-          status = fdb_commit(fhandle, FDB_COMMIT);
-          start = clock();
-       }
-    }
-    
-    //final commit
-    status = fdb_commit(fhandle, FDB_COMMIT_MANUAL_WAL_FLUSH);
-
-    gettimeofday(&index_stoptime, NULL);
-    incrindexbuilddone = true;
-    fprintf(resultfile, "\nincremental index build time: %d seconds\n", 
-                           (index_stoptime.tv_sec-index_starttime.tv_sec));
-    printf("\nnumincrmutations written: %lu \nincremental index build time: %d seconds\n", 
-              numincrmutationsdone,(index_stoptime.tv_sec-index_starttime.tv_sec));
-    free(keybuf1);
-    free(keybuf2);
-    fdb_doc_free(doc1);  
-    fdb_doc_free(doc2);  
-    //wait for compactor thread to terminate
-    pthread_join(compactor_thread,NULL);
-    fdb_kvs_close(kvhandle1); 
-    fdb_kvs_close(kvhandle2); 
-    fdb_close(fhandle);  
-    free(argcompact);
-    return arg;
-}
-
-void *do_reads(void *arg)
-{
-   fdb_file_handle *fhandle;
-   fdb_kvs_handle *kvhandle;
-   fdb_kvs_handle *snapshot;
-   fdb_kvs_config kvs_config;
-   fdb_config config;
-   fdb_seqnum_t seqnum;
-   fdb_iterator *itr_kv;
-   fdb_doc *doc;
-   fdb_status status;
-   int itr_reads;
-   int keylen;
-   char *keybuf;
-   clock_t start;
-   struct timeval read_starttime, read_stoptime;
-   unsigned long numreads = 0;
-   unsigned long num_opened_snapshots = 0;
-   int tid = *(int *)arg;
-   void *startkey;
-   int startkeylen;
-   printf("\nstarting reader thread id: %d", tid); 
-   
-   config = fdb_get_default_config();
-   kvs_config = fdb_get_default_kvs_config();
-   status = fdb_open(&fhandle, "data/secondaryDB", &config);
-   assert(status == FDB_RESULT_SUCCESS);
-   if(tid%2==0){
-      status = fdb_kvs_open(fhandle, &kvhandle,"kvstore1" , &kvs_config);
-      assert(status == FDB_RESULT_SUCCESS);
-      printf("\nreader thread id: %d opened kvstore1", tid); 
-   }
-   else{
-      status = fdb_kvs_open(fhandle, &kvhandle,"kvstore2" , &kvs_config);
-      assert(status == FDB_RESULT_SUCCESS);
-      printf("\nreader thread id: %d opened kvstore2", tid); 
-   }   
-   //allocate the document buffer once
-   keylen = 4096; 
-   keybuf = (char *)malloc(sizeof(char)*keylen);
-   memset((void *)keybuf, 0, sizeof(char)*keylen);
-
-   status = fdb_doc_create(&doc, (const void *)keybuf, keylen, 
-                               NULL, 0, NULL, 0);
-   assert(status == FDB_RESULT_SUCCESS);
-   startkey = NULL;
-   startkeylen = 0;
-   gettimeofday(&read_starttime, NULL);
-   while(!incrindexbuilddone){ 
-      if(read_pattern==SEQ && ((numreads<(numincrmutationsdone/num_rthreads))|| !num_wthreads))
-      {  
-         //always open in-memory snapshots if there are writes between COMMIT
-         //and snapshot_open
-         do{
-            status = fdb_snapshot_open(kvhandle, &snapshot, FDB_SNAPSHOT_INMEM);
-         }while(status != FDB_RESULT_SUCCESS);
-         num_opened_snapshots++; 
-         do{
-            status = fdb_iterator_init(snapshot, &itr_kv,
-                                       startkey, startkeylen, NULL, 0,
-                                       FDB_ITR_NONE);
-         } while(status != FDB_RESULT_SUCCESS); 
-      
-         itr_reads = 0; 
-         while(fdb_iterator_next(itr_kv) != FDB_RESULT_ITERATOR_FAIL){
-            status = fdb_iterator_get(itr_kv, &doc);
-            assert (status == FDB_RESULT_SUCCESS);
-            numreads++;
-            itr_reads++;
-            if(itr_reads>max_itr_reads){
-               startkey = doc->key;
-               startkeylen = doc->keylen;
-               break;
-            }  
-         }   
-         fdb_iterator_close(itr_kv);
-         status = fdb_kvs_close(snapshot);
-      if(numreads>=(numincrmutations-10))//exit criteria for read only case
-         goto readstats;
-      }
-      else if(read_pattern==RANGE && ((numreads<(numincrmutationsdone/num_rthreads))|| !num_wthreads))
-      {
-         startkey = malloc(5*sizeof(char));//generate random start keys of length 5 chars
-         startkeylen = 5;
-         max_itr_reads = rand()%4000+1000; 
-         strgen((char *)startkey, startkeylen); 
-         //always open in-memory snapshots if there are writes between COMMIT
-         //and snapshot_open
-         do{
-            status = fdb_snapshot_open(kvhandle, &snapshot, FDB_SNAPSHOT_INMEM);
-         }while(status != FDB_RESULT_SUCCESS);
-         num_opened_snapshots++; 
-         do{
-            status = fdb_iterator_init(snapshot, &itr_kv,
-                                       startkey, startkeylen, NULL, 0,
-                                       FDB_ITR_NONE);
-         } while(status != FDB_RESULT_SUCCESS); 
-      
-         itr_reads = 0; 
-         while(fdb_iterator_next(itr_kv) != FDB_RESULT_ITERATOR_FAIL){
-            status = fdb_iterator_get(itr_kv, &doc);
-            assert (status == FDB_RESULT_SUCCESS);
-            numreads++;
-            itr_reads++;
-            if(itr_reads>max_itr_reads){
-               break;
-            }  
-         }   
-         fdb_iterator_close(itr_kv);
-         status = fdb_kvs_close(snapshot);
-      if(numreads>=(numincrmutations-10))//exit criteria for read only case
-         goto readstats;
-     }
-   } 
-readstats:   
-   gettimeofday(&read_stoptime, NULL); 
-   free(keybuf);
-   fdb_doc_free(doc);  
-   fdb_kvs_close(kvhandle); 
-   fdb_close(fhandle); 
-   printf("\nreader thread id: %d num snapshots opened: %lu num of reads done: %lu", 
-                                                             tid,num_opened_snapshots, numreads); 
-   fprintf(resultfile,"\nreader thread id: %d num snapshots opened: %lu num of reads done: %lu"
-                                "time elapsed for reads:%d",tid,num_opened_snapshots, numreads,
-                                                  (read_stoptime.tv_sec-read_starttime.tv_sec)); 
-   return arg;
-}
-
-void *compactor(void *arg)
-{
-    
-    fdb_file_handle *fhandle;
-    fdb_config config;
-    fdb_kvs_config kvs_config;
-    fdb_snapshot_info_t *markers;
-    uint64_t num_markers;
-    fdb_status status;
-    clock_t start;
-    struct timeval compact_starttime, compact_stoptime;
-    int compactrunnum;
-    config = fdb_get_default_config();
-    status = fdb_open(&fhandle, "data/secondaryDB", &config);
-    sleep(60);
-    printf("compactor starting");
-    fprintf(resultfile, "compactor thread has started");
-    compactrunnum = 0; 
-    while(!incrindexbuilddone){
-       gettimeofday(&compact_starttime, NULL); 
-       //status = fdb_get_all_snap_markers(fhandle, &markers, &num_markers);
-       //status = fdb_compact_upto(fhandle, NULL, markers[0].marker);//manual compaction every 60 seconds
-       //status = fdb_free_snap_markers(markers, num_markers);
-       status = fdb_compact(fhandle, NULL);
-       gettimeofday(&compact_stoptime, NULL); 
-       compactrunnum++;
-       fprintf(resultfile,"\nCompaction run %d took %d seconds to complete", compactrunnum,
-                                                        (compact_stoptime.tv_sec-compact_starttime.tv_sec));
-       sleep(60);
-    }
+    free(main_key_buf);
+    free(back_key_buf);
+    fdb_doc_free(main_doc);
+    fdb_doc_free(back_doc);
+    fdb_kvs_close(main_handle);
+    fdb_kvs_close(back_handle);
     fdb_close(fhandle);
-    return arg;
 }
 
-int do_initial_load(int num_wthreads, int num_rthreads, int num_delthreads)
+void do_initial_load()
 {
-   pthread_t bench_thread[num_wthreads+num_rthreads+num_delthreads];
-   int *arg[num_wthreads+num_rthreads+num_delthreads];
-   
-   //spawn writer threads
-   for (int i=0; i<num_wthreads; i++){
-       arg[i] = (int *)malloc(sizeof(int));
-       *arg[i] = i;
-       pthread_create(&bench_thread[i],NULL, do_writes, (void *)arg[i]);                
-   }
-   
-   
-   //spawn reader threads
-   for (int i=0; i<num_rthreads; i++){
-       arg[num_wthreads+i] = (int *)malloc(sizeof(int));
-       *arg[num_wthreads+i] = i;
-       printf("\nspawning reader thread id: %d", *arg[num_wthreads+i]); 
-       pthread_create(&bench_thread[num_wthreads+i],NULL, do_reads, 
-                      (void *)arg[num_wthreads+i]);                
-   }
-   
-   //spawn delete threads
-   for (int i=0; i<num_delthreads; i++){
-       arg[num_wthreads+num_rthreads+i] = (int *)malloc(sizeof(int));
-       *arg[num_wthreads+num_rthreads+i] = i;
-       printf("\nspawning delete thread id: %d", *arg[num_wthreads+num_rthreads+i]); 
-       pthread_create(&bench_thread[num_wthreads+num_rthreads+i],NULL, do_deletes, 
-                      (void *)arg[num_wthreads+num_rthreads+i]);                
-   }
+    //Only one writer thread during initial load
+    //I agree that loops are unnecessary
 
+    int dummy = 0;
+    pthread_t bench_thread[1];
 
-   for (int i = 0; i<num_wthreads+num_rthreads+num_delthreads; i++){
-       pthread_join(bench_thread[i],NULL);
-       free(arg[i]);
-   }
-   return true;
+    //spawn writer threads
+    for (int i=0; i<1; i++){
+        pthread_create(&bench_thread[i], NULL, do_initial_write, NULL);
+    }
+
+    for (int i = 0; i<1; i++){
+        pthread_join(bench_thread[i],NULL);
+    }
 }
 
-int do_incremental_load(int num_wthreads, int num_rthreads)
-{ 
-   pthread_t bench_thread[num_wthreads+num_rthreads];
-   int *arg[num_wthreads+num_rthreads];
-   
-   //spawn writer threads
-   for (int i=0; i<num_wthreads; i++){
-       arg[i] = (int *)malloc(sizeof(int));
-       *arg[i] = i;
-       printf("\nspawning incremental writer thread id: %d", *arg[i]); 
-       pthread_create(&bench_thread[i],NULL, do_incremental_writes, (void *)arg[i]);                
-   }
-   
-   //spawn reader threads
-   for (int i=0; i<num_rthreads; i++){
-       arg[num_wthreads+i] = (int *)malloc(sizeof(int));
-       *arg[num_wthreads+i] = i;
-       printf("\nspawning reader thread id: %d", *arg[num_wthreads+i]); 
-       pthread_create(&bench_thread[num_wthreads+i],NULL, do_reads, 
-                      (void *)arg[num_wthreads+i]);                
-   }
-   
-   for (int i = 0; i<num_wthreads+num_rthreads; i++){
-       pthread_join(bench_thread[i],NULL);
-       free(arg[i]);
-   }
-   
-   return true;
+
+void* do_incremental_writes (void*)
+{
+}
+
+int do_incremental_load()
+{
+    pthread_t bench_thread[2];
+    pthread_create(&bench_thread[0], NULL, do_incremental_writes, NULL);
+}
+
+uint64_t get_filesize(const char *filename)
+{
+    struct stat filestat;
+    assert(stat(filename, &filestat) == 0);
+    return filestat.st_size;
 }
 
 int main(int argc, char* args[])
 {
-
-    struct sysinfo mysysinfo;
-    static dictionary *cfg = iniparser_new((char*)"./bench_config.ini");
-    char *testtype = iniparser_getstring(cfg, (char*)"test_type:testtype", (char*)"initial");
-    char *indextype = iniparser_getstring(cfg, (char*)"index_type:indextype", (char*)"secondary");
-    char *committype = iniparser_getstring(cfg, (char*)"commit_type:committype", (char*)"normal");
-    numinitdocs = iniparser_getint(cfg, (char*)"document:numinitdocs", 10000);
-    numincrmutations = iniparser_getint(cfg, (char*)"document:numincrmutations", 10000);
+    // get config
+    dictionary *cfg = iniparser_new((char*) "./bench_config.ini");
+    numinitdocs = iniparser_getint(cfg, (char*)"workload:numinitdocs", 1000000);
+    numincrdocs = iniparser_getint(cfg, (char*)"workload:numincrdocs", 1000000);
+    read_batch  = iniparser_getint(cfg, (char*)"workload:iter_read_batch_size", 1000);
     buffercachesizeMB = iniparser_getint(cfg, (char*)"db_config:buffercachesizeMB", 1024);
-    num_wthreads = iniparser_getint(cfg, (char*)"threads:writers", 1);
-    num_rthreads = iniparser_getint(cfg, (char*)"threads:readers", 4);
-    read_pattern = iniparser_getint(cfg, (char*)"workload_pattern:read_pattern", 2);
-    wbatch_size = iniparser_getint(cfg, (char*)"batchparams:wbatch_size", 100);
-    max_itr_reads = iniparser_getint(cfg, (char*)"batchparams:maxreads_per_iterator", 1000000);
-    const char *resultfilename = (const char*)iniparser_getstring(cfg, (char*)"result_file:resultfilename", 
-                                                                                (char*)"initialsecondary");
-    indexbuilddone = false;
-    incrindexbuilddone = false;
-    resultfile = fopen(resultfilename,"a"); 
-    fprintf(resultfile, "ForestDB Benchmarking\n", testtype);
-    //set the forestdb commit type for writes
-    if(committype[0]=='n'||committype[0]=='N') FDB_COMMIT = FDB_COMMIT_NORMAL; 
-    else FDB_COMMIT = FDB_COMMIT_MANUAL_WAL_FLUSH; 
-    //record test params
-    fprintf(resultfile, "\ntest type: %s", testtype);
-    fprintf(resultfile, "\nindex type: %s", indextype);
-    fprintf(resultfile, "\nnumber of documents: %d", numinitdocs);
-    fprintf(resultfile, "\nbuffer cache size: %d MB", buffercachesizeMB);
-    fprintf(resultfile, "\nwrite batch size: %d", wbatch_size);
-    fprintf(resultfile, "\nnumber of incremental writer threads: %d", num_wthreads);
-    fprintf(resultfile, "\nnumber of incremental reader threads: %d", num_rthreads);
-    fprintf(resultfile, "\ncommit type: %s", committype);
+    const char *resultfilename = (const char*) iniparser_getstring(cfg, (char*)"general:resultfilename",
+                                                                   (char*)"initialsecondary");
+    lock_prob = iniparser_getint(cfg, (char*)"db_config:lock_prob", 100);
+
+    resultfile = fopen(resultfilename, "a");
+    fprintf(resultfile, "\nNumber of initial documents: %d", numinitdocs);
+    fprintf(resultfile, "\nNumber of incremental documents: %d", numincrdocs);
+    fprintf(resultfile, "\nHow many iterator reads before moving the start key: %d", read_batch);
+    fprintf(resultfile, "\nSize of buffer cache: %d MB", buffercachesizeMB);
+    fprintf(resultfile, "\n");
+
     //initialize DB and KV instances
-    init_fdb_with_kvs(NULL,2);
+    assert( init_fdb_with_kvs() == true);
+
     //initialize random generator
     srand (time(NULL));
-    //lock memory to minimize OS page cache
-    //lockmemory(buffercachesizeMB); commenting out due to OOM killer trouble
-    //start workload
-    do_initial_load(1,0,0); //initial load always uses 1 writer, 0 readers, 0 deleters
+    
+    do_initial_load();
     fprintf(resultfile, "\ndatabase file size after initial load: %.2f GB", (double)get_filesize(
                                                              "data/secondaryDB")/(1024*1024*1024));
-    if(testtype[0]=='o'||testtype[0]=='O')
-    {
-       do_incremental_load(num_wthreads, num_rthreads); //incremental load always uses 1 writer
-    }
+    do_incremental_load(); //incremental load always uses 1 writer
     fprintf(resultfile, "\nfinal database file size: %.2f GB", (double)get_filesize(
                                                              "data/secondaryDB")/(1024*1024*1024));
-} 
+    fprintf(resultfile, "\n");
+    
+}

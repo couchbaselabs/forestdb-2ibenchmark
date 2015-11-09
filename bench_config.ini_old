@@ -1,0 +1,47 @@
+initial or ongoing
+[test_type]
+testtype = ongoing
+
+;primary or secondary
+[index_type]
+indextype = secondary
+
+[document]
+numinitdocs = 2000000
+numincrmutations = 2000000
+
+[compaction]
+lock_prob = 100
+[db_config]
+buffercachesizeMB = 30720
+;manual or auto
+compaction_mode = manual
+wbs_init_MB = 4096
+
+[db_file]
+filename = data/secondaryDB
+nfiles = 1
+
+[result_file]
+resultfilename =  incrementalsecondary
+
+[population]
+nthreads = 6
+
+;used for ongoing workload
+[threads]
+readers = 0
+writers = 1
+reader_ops = 50
+writer_ops = 50
+
+[workload_pattern]
+;1 - seq/2 - range 
+read_pattern = 2
+;manual_wal_flush or normal
+[commit_type]
+committype = normal  
+
+[batchparams]
+wbatch_size = 100
+maxreads_per_iterator = 200000
