@@ -44,11 +44,53 @@ static int update_performed = 0;
 static int create_marker = 0;
 static int delete_marker = 0;
 
+static int LOG_LEVEL = 1;
+
+void wrap_fdb_get(fdb_kvs_handle * handle, fdb_doc * doc){
+    fdb_status status;
+    status = fdb_get(handle, doc);
+    if (status != FDB_RESULT_SUCCESS){
+        printf("fdb_get:");
+        fwrite(doc->key, doc->keylen, 1, stdout);
+        printf("\n");
+    }
+    status == 0 ? : printf("\nget status %i\n", status);
+    assert(status == 0);
+}
+
+void wrap_fdb_set(fdb_kvs_handle * handle, fdb_doc * doc){
+    fdb_status status;
+    status = fdb_set(handle, doc);
+    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 1){
+        printf("fdb_set:");
+        fwrite(doc->key, doc->keylen, 1, stdout);
+        printf("\n");
+    }
+    status == 0 ? : printf("\nset status %i\n", status);
+    assert(status == 0);
+}
+
+void wrap_fdb_del(fdb_kvs_handle * handle, fdb_doc * doc){
+    fdb_status status;
+    status = fdb_del(handle, doc);
+    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 1){
+        printf("fdb_del:");
+        fwrite(doc->key, doc->keylen, 1, stdout);
+        printf("\n");
+    }
+    status == 0 ? : printf("\ndel status %i\n", status);
+    assert(status == 0);
+}
+
+
+
 void fill_key(char* buffer, unsigned long long marker){
     //hash the marker and fill the result into buffer.
     const char *prefix = "secidx";
     sprintf(buffer, "%s", prefix);
     sprintf(buffer+6, "%014d", XXH64(&marker, sizeof(marker), 1));
+    //fwrite(buffer, 20, 1, stdout);
+    //printf(" fill key marker %i\n", marker);
 }
 
 int init_fdb_with_kvs()
@@ -141,13 +183,10 @@ void * do_initial_write(void*)
         memcpy(main_doc->key, back_doc->body, field_value_len);
         memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
  
-        do{
-            status = fdb_set(main_handle, main_doc);
-        } while(status!=FDB_RESULT_SUCCESS);
+        assert(fdb_set(main_handle, main_doc) == FDB_RESULT_SUCCESS);
 
-        do{
-           status = fdb_set(back_handle, back_doc);
-        } while(status!=FDB_RESULT_SUCCESS);
+        wrap_fdb_set(back_handle, back_doc);
+
         numinitdocswritten++;
  
         // Every 300 seconds, call commit, during initial load phase
@@ -264,77 +303,54 @@ void* do_incremental_mutations (void*)
             memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
             
             // Write both documents to both indexes
-            do{
-                status = fdb_set(main_handle, main_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
-
-            do{
-               status = fdb_set(back_handle, back_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
+            assert(fdb_set(main_handle, main_doc) == FDB_RESULT_SUCCESS);
+            wrap_fdb_set(back_handle, back_doc);
 
             create_marker++;
             create_performed++;
         } else if (which_op < update_draw) {
             int temp = rand() % (create_marker - delete_marker);
             update_marker = delete_marker + temp;
-            printf("create marker %i\n", create_marker);
             printf("update marker %i\n", update_marker);
-            printf("delete marker %i\n", delete_marker);
 
             //re-generate an old doc id from marker.
             fill_key((char *)back_doc->key, update_marker);
             // Get the body for the key
             memset((void *) back_doc->body, 0, sizeof(char) * field_value_len);
-            printf("fdb get\n");
-            do{
-                status = fdb_get(back_handle, back_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
+
+            wrap_fdb_get(back_handle, back_doc);
 
             // This is the main doc to delete
-            printf("main delete\n");
             memcpy(main_doc->key, back_doc->body, field_value_len);
             memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
-            do{
-                status = fdb_del(main_handle, main_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
+            assert(fdb_del(main_handle, main_doc) == FDB_RESULT_SUCCESS);
 
             // new main doc with new field value
             strgen((char *)back_doc->body, field_value_len);
             memcpy(main_doc->key, back_doc->body, field_value_len);
 
             // Write both documents to both indexes
-            printf("write both\n");
-            do{
-                status = fdb_set(main_handle, main_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
-
-            do{
-               status = fdb_set(back_handle, back_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
+            assert(fdb_set(main_handle, main_doc) == FDB_RESULT_SUCCESS);
+            wrap_fdb_set(back_handle, back_doc);
 
             update_performed++;
         } else if (delete_marker < create_marker) {
-            printf("delete op\n");
+            printf("delete op %i\n", delete_marker);
             //delete draw
             //re-generate an old doc id from marker.
             fill_key((char *)back_doc->key, delete_marker);
             // Get the body for the key
             memset((void *) back_doc->body, 0, sizeof(char) * field_value_len);
-            do{
-                status = fdb_get(back_handle, back_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
+
+            wrap_fdb_get(back_handle, back_doc);
 
             // This is the main doc to delete
             memcpy(main_doc->key, back_doc->body, field_value_len);
             memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
-            do{
-                status = fdb_del(main_handle, main_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
+            assert(fdb_del(main_handle, main_doc) == FDB_RESULT_SUCCESS);
 
             // Also delete back_doc
-            do{
-                status = fdb_del(back_handle, back_doc);
-            } while(status!=FDB_RESULT_SUCCESS);
+            wrap_fdb_del(back_handle, back_doc);
 
             delete_marker++;
         }
