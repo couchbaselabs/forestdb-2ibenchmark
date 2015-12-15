@@ -33,32 +33,47 @@ static bool incr_index_build_done = false;
 // This has to be 20. Some hardcoding logic. See fill_key.
 const size_t docid_len = 20;
 const size_t field_value_len = 50;
+pthread_mutex_t snapshot_lock;
 
 // control points
-static bool indexbuilddone = false;
 static bool incrindexbuilddone = false;
 static int create_draw = 0;
 static int update_draw = 0;
+static int incr_commit_interval_ms = 0;
+static int incr_compaction_interval = 0;
 static int create_performed = 0;
 static int update_performed = 0;
 static int create_marker = 0;
 static int delete_marker = 0;
 
-static int LOG_LEVEL = 1;
+static int LOG_LEVEL = 0;
 
+/* To reuse fdb_doc and preserve the flags and other meta data after an initial
+ * fdb_doc_create, make sure you always use these wrap_fdb_* calls which saves
+ * the previous state. The fdb_doc's non-pointer values should be kept the same
+ * as after the fdb_doc_create call.
+ */
 void wrap_fdb_get(fdb_kvs_handle * handle, fdb_doc * doc){
+    fdb_doc doc_backup;
+    doc_backup = *doc;
+    
     fdb_status status;
     status = fdb_get(handle, doc);
-    if (status != FDB_RESULT_SUCCESS){
+    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 1){
         printf("fdb_get:");
         fwrite(doc->key, doc->keylen, 1, stdout);
         printf("\n");
     }
     status == 0 ? : printf("\nget status %i\n", status);
-    assert(status == 0);
+    assert(status == FDB_RESULT_SUCCESS);
+
+    *doc = doc_backup;
 }
 
 void wrap_fdb_set(fdb_kvs_handle * handle, fdb_doc * doc){
+    fdb_doc doc_backup;
+    doc_backup = *doc;
+
     fdb_status status;
     status = fdb_set(handle, doc);
     if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 1){
@@ -67,10 +82,15 @@ void wrap_fdb_set(fdb_kvs_handle * handle, fdb_doc * doc){
         printf("\n");
     }
     status == 0 ? : printf("\nset status %i\n", status);
-    assert(status == 0);
+    assert(status == FDB_RESULT_SUCCESS);
+
+    *doc = doc_backup;
 }
 
 void wrap_fdb_del(fdb_kvs_handle * handle, fdb_doc * doc){
+    fdb_doc doc_backup;
+    doc_backup = *doc;
+
     fdb_status status;
     status = fdb_del(handle, doc);
     if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 1){
@@ -79,10 +99,10 @@ void wrap_fdb_del(fdb_kvs_handle * handle, fdb_doc * doc){
         printf("\n");
     }
     status == 0 ? : printf("\ndel status %i\n", status);
-    assert(status == 0);
+    assert(status == FDB_RESULT_SUCCESS);
+
+    *doc = doc_backup;
 }
-
-
 
 void fill_key(char* buffer, unsigned long long marker){
     //hash the marker and fill the result into buffer.
@@ -124,7 +144,7 @@ int init_fdb_with_kvs()
     return true;
 }
 
-void * do_initial_write(void*)
+void* do_initial_write(void*)
 {
     fdb_file_handle *fhandle;
     fdb_kvs_handle *main_handle;
@@ -151,8 +171,7 @@ void * do_initial_write(void*)
 
     /*
      * Main index is a covering index that concatenates field value and docid
-     * back index is a docid -> value mapping
-     * Initialize the buffers and docs for main and back indexes.
+     * back index is a docid -> value KV mapping
      */
     main_key_buf = (char *)malloc(sizeof(char) * (docid_len + field_value_len));
     back_key_buf = (char *)malloc(sizeof(char) * docid_len);
@@ -183,8 +202,7 @@ void * do_initial_write(void*)
         memcpy(main_doc->key, back_doc->body, field_value_len);
         memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
  
-        assert(fdb_set(main_handle, main_doc) == FDB_RESULT_SUCCESS);
-
+        wrap_fdb_set(main_handle, main_doc);
         wrap_fdb_set(back_handle, back_doc);
 
         numinitdocswritten++;
@@ -235,8 +253,7 @@ void do_initial_load()
     }
 }
 
-
-void* do_incremental_mutations (void*)
+void* do_incremental_mutations(void*)
 {
     fdb_file_handle *fhandle;
     fdb_kvs_handle *main_handle;
@@ -293,7 +310,8 @@ void* do_incremental_mutations (void*)
     while(num_ops < num_incr_ops){
         which_op = rand() % 100;
         if (which_op < create_draw){
-            printf( "create op\n");
+            if (LOG_LEVEL >= 2) printf( "create op\n");
+
             //generate a new document
             fill_key((char *)back_doc->key, create_marker);
             strgen((char *)back_doc->body, field_value_len);
@@ -303,7 +321,7 @@ void* do_incremental_mutations (void*)
             memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
             
             // Write both documents to both indexes
-            assert(fdb_set(main_handle, main_doc) == FDB_RESULT_SUCCESS);
+            wrap_fdb_set(main_handle, main_doc);
             wrap_fdb_set(back_handle, back_doc);
 
             create_marker++;
@@ -311,7 +329,8 @@ void* do_incremental_mutations (void*)
         } else if (which_op < update_draw) {
             int temp = rand() % (create_marker - delete_marker);
             update_marker = delete_marker + temp;
-            printf("update marker %i\n", update_marker);
+
+            if (LOG_LEVEL >= 2) printf("update marker %i\n", update_marker);
 
             //re-generate an old doc id from marker.
             fill_key((char *)back_doc->key, update_marker);
@@ -323,19 +342,19 @@ void* do_incremental_mutations (void*)
             // This is the main doc to delete
             memcpy(main_doc->key, back_doc->body, field_value_len);
             memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
-            assert(fdb_del(main_handle, main_doc) == FDB_RESULT_SUCCESS);
+            wrap_fdb_del(main_handle, main_doc);
 
             // new main doc with new field value
             strgen((char *)back_doc->body, field_value_len);
             memcpy(main_doc->key, back_doc->body, field_value_len);
 
             // Write both documents to both indexes
-            assert(fdb_set(main_handle, main_doc) == FDB_RESULT_SUCCESS);
+            wrap_fdb_set(main_handle, main_doc);
             wrap_fdb_set(back_handle, back_doc);
 
             update_performed++;
         } else if (delete_marker < create_marker) {
-            printf("delete op %i\n", delete_marker);
+            if (LOG_LEVEL >= 2) printf("delete op %i\n", delete_marker);
             //delete draw
             //re-generate an old doc id from marker.
             fill_key((char *)back_doc->key, delete_marker);
@@ -347,7 +366,7 @@ void* do_incremental_mutations (void*)
             // This is the main doc to delete
             memcpy(main_doc->key, back_doc->body, field_value_len);
             memcpy((void *)((char *)main_doc->key + field_value_len), back_doc->key, docid_len);
-            assert(fdb_del(main_handle, main_doc) == FDB_RESULT_SUCCESS);
+            wrap_fdb_del(main_handle, main_doc);
 
             // Also delete back_doc
             wrap_fdb_del(back_handle, back_doc);
@@ -356,12 +375,9 @@ void* do_incremental_mutations (void*)
         }
         num_ops++;
 
-        // only makes sense to consider commit after a fdb_set.
-        if (which_op < update_draw){
-            if(((clock() - commit_checkpoint) * 1000 /(double) CLOCKS_PER_SEC) > 100){
-               status = fdb_commit(fhandle, FDB_COMMIT);
-               commit_checkpoint = clock();
-            }
+        if(((clock() - commit_checkpoint) * 1000 /(double) CLOCKS_PER_SEC) > incr_commit_interval_ms){
+           status = fdb_commit(fhandle, FDB_COMMIT);
+           commit_checkpoint = clock();
         }
 
     } // while loop 
@@ -383,8 +399,60 @@ void* do_incremental_mutations (void*)
     fdb_kvs_close(main_handle);
     fdb_kvs_close(back_handle);
     fdb_close(fhandle);
+
+    incrindexbuilddone = true;
 }
 
+void* do_compact(void*)
+{
+    fdb_file_handle *fhandle;
+    fdb_status status;
+    fdb_config config;
+    config = fdb_get_default_config();
+    config.compaction_mode = FDB_COMPACTION_MANUAL;
+    status = fdb_open(&fhandle, "data/secondaryDB", &config);
+    assert(status == FDB_RESULT_SUCCESS);
+
+    if (LOG_LEVEL >= 2) printf("compactor starting");
+    fprintf(resultfile, "compactor thread has started\n");
+
+    int compact_num = 0;
+    struct timeval compact_starttime, compact_stoptime;
+    while(!incrindexbuilddone){
+        sleep(incr_compaction_interval);
+
+        pthread_mutex_lock(&snapshot_lock);
+        gettimeofday(&compact_starttime, NULL);
+        status = fdb_compact(fhandle, NULL);
+        gettimeofday(&compact_stoptime, NULL);
+        pthread_mutex_unlock(&snapshot_lock);
+        assert(status == FDB_RESULT_SUCCESS);
+
+        compact_num++;
+        fprintf(resultfile,"Compaction run %d took %lu seconds to complete\n", compact_num,
+                (compact_stoptime.tv_sec - compact_starttime.tv_sec));
+    }
+
+    // final compact
+    pthread_mutex_lock(&snapshot_lock);
+    gettimeofday(&compact_starttime, NULL);
+    status = fdb_compact(fhandle, NULL);
+    gettimeofday(&compact_stoptime, NULL);
+    pthread_mutex_unlock(&snapshot_lock);
+    assert(status == FDB_RESULT_SUCCESS);
+
+    compact_num++;
+    fprintf(resultfile,"Compaction run %d took %lu seconds to complete\n", compact_num,
+            (compact_stoptime.tv_sec - compact_starttime.tv_sec));
+
+    fprintf(resultfile, "compactor thread has ended\n");
+    fdb_close(fhandle);
+}
+
+void* do_read(void*)
+{
+
+}
 void do_incremental_load()
 {
 
@@ -394,10 +462,12 @@ void do_incremental_load()
     pthread_create(&incr_threads[0], NULL, do_incremental_mutations, NULL);
 
     // also start compactor thread here
+    pthread_create(&incr_threads[1], NULL, do_compact, NULL);
 
     // start reader thread
+    //pthread_create(&incr_threads[2], NULL, do_read, NULL);
 
-    for (int i = 0; i<1; i++){
+    for (int i = 0; i<2; i++){
         pthread_join(incr_threads[i], NULL);
     }
 
@@ -431,6 +501,9 @@ int main(int argc, char* args[])
     create_draw = create_ratio;
     update_draw = create_draw + update_ratio;
 
+    incr_commit_interval_ms = iniparser_getint(cfg, (char*)"workload:incr_commit_interval_ms", 200);
+    incr_compaction_interval = iniparser_getint(cfg, (char*)"workload:incr_compaction_interval", 10);
+
     read_batch  = iniparser_getint(cfg, (char*)"workload:iter_read_batch_size", 1000);
     buffercachesizeMB = iniparser_getint(cfg, (char*)"db_config:buffercachesizeMB", 1024);
     const char *resultfilename = (const char*) iniparser_getstring(cfg, (char*)"general:resultfilename",
@@ -446,16 +519,17 @@ int main(int argc, char* args[])
 
     //initialize DB and KV instances
     assert(init_fdb_with_kvs() == true);
+    assert(pthread_mutex_init(&snapshot_lock, NULL) == 0);
 
     //initialize random generator
     //srand (time(NULL));
     srand(1);
     
     do_initial_load();
-    fprintf(resultfile, "\ndatabase file size after initial load: %.4f GB", (double)get_filesize(
+    fprintf(resultfile, "\ndatabase file size after initial load: %.4f GB\n", (double)get_filesize(
                                                              "data/secondaryDB")/(1024*1024*1024));
     do_incremental_load(); //incremental load always uses 1 writer
-    fprintf(resultfile, "\nfinal database file size: %.4f GB", (double)get_filesize(
+    fprintf(resultfile, "\nfinal database file size: %.4f GB\n", (double)get_filesize(
                                                              "data/secondaryDB")/(1024*1024*1024));
     fprintf(resultfile, "\n");
     
