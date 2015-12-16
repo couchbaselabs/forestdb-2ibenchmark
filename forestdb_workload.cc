@@ -7,6 +7,7 @@ Notes
 */
 
 #include <assert.h>
+#include <deque>
 #include <unistd.h>
 #include <stdio.h>
 #include <pthread.h>
@@ -25,7 +26,10 @@ static int num_incr_ops;
 static int read_batch;
 static int lock_prob;
 static int buffercachesizeMB;
-static fdb_commit_opt_t FDB_COMMIT = FDB_COMMIT_MANUAL_WAL_FLUSH;
+static int incr_commit_interval_ms = 0;
+static int incr_compaction_interval = 0;
+static int incr_inmem_snapshot_interval_ms = 0;
+static int iter_reads_batch_size;
 
 // general
 FILE * resultfile;
@@ -33,20 +37,27 @@ static bool incr_index_build_done = false;
 // This has to be 20. Some hardcoding logic. See fill_key.
 const size_t docid_len = 20;
 const size_t field_value_len = 50;
-pthread_mutex_t snapshot_lock;
+//persist_lock needed if we open persisted snapshot for reading
+pthread_mutex_t persist_lock;
+// Synchronize inmemory snapshot creation and reading
+pthread_mutex_t inmem_lock;
+// store open in memory snapshots
+static std::deque<fdb_kvs_handle *> inmem_snapshots;
 
 // control points
 static bool incrindexbuilddone = false;
 static int create_draw = 0;
 static int update_draw = 0;
-static int incr_commit_interval_ms = 0;
-static int incr_compaction_interval = 0;
 static int create_performed = 0;
 static int update_performed = 0;
+static int read_performed = 0;
 static int create_marker = 0;
 static int delete_marker = 0;
 
 static int LOG_LEVEL = 0;
+
+// STATS
+static int num_snapshots_opened = 0;
 
 /* To reuse fdb_doc and preserve the flags and other meta data after an initial
  * fdb_doc_create, make sure you always use these wrap_fdb_* calls which saves
@@ -209,8 +220,8 @@ void* do_initial_write(void*)
  
         // Every 300 seconds, call commit, during initial load phase
         if(((clock() - commit_checkpoint)/(double) CLOCKS_PER_SEC) > 300){
-           status = fdb_commit(fhandle, FDB_COMMIT);
-           commit_checkpoint = clock();
+            status = fdb_commit(fhandle, FDB_COMMIT_MANUAL_WAL_FLUSH);
+            commit_checkpoint = clock();
         }
     }
 
@@ -222,6 +233,9 @@ void* do_initial_write(void*)
     fprintf(resultfile,
             "\nnuminitdocs written: %lu \ninitial index build time: %d seconds\n",
             numinitdocswritten, (index_stoptime.tv_sec-index_starttime.tv_sec));
+
+    status = fdb_compact(fhandle, NULL);
+    assert(status == FDB_RESULT_SUCCESS);
 
     free(main_key_buf);
     free(back_key_buf);
@@ -258,6 +272,7 @@ void* do_incremental_mutations(void*)
     fdb_file_handle *fhandle;
     fdb_kvs_handle *main_handle;
     fdb_kvs_handle *back_handle;
+    fdb_kvs_handle *snapshot;
     fdb_config config;
     fdb_kvs_config kvs_config;
     fdb_doc *main_doc, *back_doc;
@@ -265,6 +280,7 @@ void* do_incremental_mutations(void*)
     char * main_key_buf, *back_key_buf, *back_value_buf;
     struct timeval index_starttime, index_stoptime;
     clock_t commit_checkpoint;
+    clock_t inmem_snapshot_checkpoint;
 
     config = fdb_get_default_config();
     config.max_writer_lock_prob = lock_prob;
@@ -300,6 +316,7 @@ void* do_incremental_mutations(void*)
 
     //start commit clock
     commit_checkpoint = clock();
+    inmem_snapshot_checkpoint = clock();
     gettimeofday(&index_starttime, NULL);
     int num_ops = 0;
     create_marker = numinitdocs;
@@ -375,8 +392,20 @@ void* do_incremental_mutations(void*)
         }
         num_ops++;
 
+        // open in-memory snapshot every X miliseconds
+        if(((clock() - inmem_snapshot_checkpoint) * 1000 /(double) CLOCKS_PER_SEC) > incr_inmem_snapshot_interval_ms){
+            status = fdb_snapshot_open(main_handle, &snapshot, FDB_SNAPSHOT_INMEM); 
+            assert(status == FDB_RESULT_SUCCESS);
+            pthread_mutex_lock(&inmem_lock);
+            inmem_snapshots.push_front(snapshot);
+            pthread_mutex_unlock(&inmem_lock);
+            num_snapshots_opened++;
+            
+            inmem_snapshot_checkpoint = clock();
+        }
+        // commit every how many miliseconds
         if(((clock() - commit_checkpoint) * 1000 /(double) CLOCKS_PER_SEC) > incr_commit_interval_ms){
-           status = fdb_commit(fhandle, FDB_COMMIT);
+           status = fdb_commit(fhandle, FDB_COMMIT_MANUAL_WAL_FLUSH);
            commit_checkpoint = clock();
         }
 
@@ -386,7 +415,6 @@ void* do_incremental_mutations(void*)
     status = fdb_commit(fhandle, FDB_COMMIT_MANUAL_WAL_FLUSH);
 
     gettimeofday(&index_stoptime, NULL);
-
     fprintf(resultfile,
             "\nincrmental index build time: %d seconds\n",
             (index_stoptime.tv_sec-index_starttime.tv_sec));
@@ -403,11 +431,16 @@ void* do_incremental_mutations(void*)
     incrindexbuilddone = true;
 }
 
+
 void* do_compact(void*)
 {
     fdb_file_handle *fhandle;
     fdb_status status;
     fdb_config config;
+    fdb_snapshot_info_t *markers;
+    uint64_t num_markers;
+    uint64_t upto;
+    
     config = fdb_get_default_config();
     config.compaction_mode = FDB_COMPACTION_MANUAL;
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
@@ -421,24 +454,29 @@ void* do_compact(void*)
     while(!incrindexbuilddone){
         sleep(incr_compaction_interval);
 
-        pthread_mutex_lock(&snapshot_lock);
-        gettimeofday(&compact_starttime, NULL);
-        status = fdb_compact(fhandle, NULL);
-        gettimeofday(&compact_stoptime, NULL);
-        pthread_mutex_unlock(&snapshot_lock);
+        //keep at least last five of markers when possible.
+        status = fdb_get_all_snap_markers(fhandle, &markers, &num_markers);
         assert(status == FDB_RESULT_SUCCESS);
+        if (num_markers > 5){
+            upto = 4;
+        } else {
+            upto = num_markers - 1;
+        }
+        gettimeofday(&compact_starttime, NULL);
+        status = fdb_compact_upto(fhandle, NULL, markers[upto].marker);
+        gettimeofday(&compact_stoptime, NULL);
+        assert(status == FDB_RESULT_SUCCESS);
+        assert(fdb_free_snap_markers(markers, num_markers) == FDB_RESULT_SUCCESS);
 
         compact_num++;
-        fprintf(resultfile,"Compaction run %d took %lu seconds to complete\n", compact_num,
-                (compact_stoptime.tv_sec - compact_starttime.tv_sec));
+        fprintf(resultfile,"Compaction run %d took %lu seconds upto %ju\n", compact_num,
+                (compact_stoptime.tv_sec - compact_starttime.tv_sec), upto);
     }
 
     // final compact
-    pthread_mutex_lock(&snapshot_lock);
     gettimeofday(&compact_starttime, NULL);
     status = fdb_compact(fhandle, NULL);
     gettimeofday(&compact_stoptime, NULL);
-    pthread_mutex_unlock(&snapshot_lock);
     assert(status == FDB_RESULT_SUCCESS);
 
     compact_num++;
@@ -451,7 +489,42 @@ void* do_compact(void*)
 
 void* do_read(void*)
 {
+    fdb_kvs_handle *snapshot;
+    fdb_doc *doc = NULL;
+    fdb_status status;
+    fdb_iterator *itr_key;
+    int read_count = 0;
 
+    while(!incrindexbuilddone){
+        pthread_mutex_lock(&inmem_lock);
+        if (inmem_snapshots.size() == 0) continue;
+        while(inmem_snapshots.size()>5){
+            snapshot = inmem_snapshots.back();
+            inmem_snapshots.pop_back();
+            fdb_kvs_close(snapshot);
+        }
+        snapshot = inmem_snapshots.back();
+        pthread_mutex_unlock(&inmem_lock);
+        
+        status = fdb_iterator_init(
+                    snapshot, &itr_key,
+                    NULL, 0,
+                    NULL, 0,
+                    FDB_ITR_NO_DELETES);
+        assert(status == FDB_RESULT_SUCCESS);
+        read_count = 0;
+        do {
+            status = fdb_iterator_get(itr_key, &doc);
+            if (status != FDB_RESULT_SUCCESS) {
+                break;
+            }
+            fdb_doc_free(doc);
+            read_count++;
+            read_performed++;
+        } while(read_count < iter_reads_batch_size and fdb_iterator_next(itr_key) != FDB_RESULT_ITERATOR_FAIL);
+        status = fdb_iterator_close(itr_key);
+        assert(status == FDB_RESULT_SUCCESS);
+    }
 }
 void do_incremental_load()
 {
@@ -465,16 +538,18 @@ void do_incremental_load()
     pthread_create(&incr_threads[1], NULL, do_compact, NULL);
 
     // start reader thread
-    //pthread_create(&incr_threads[2], NULL, do_read, NULL);
+    pthread_create(&incr_threads[2], NULL, do_read, NULL);
 
-    for (int i = 0; i<2; i++){
+    for (int i = 0; i<3; i++){
         pthread_join(incr_threads[i], NULL);
     }
 
     fprintf(resultfile, "\nnumber of creates performed %i", create_performed);
     fprintf(resultfile, "\nnumber of updates performed %i", update_performed);
     fprintf(resultfile, "\nnumber of deletes performed %i", delete_marker);
+    fprintf(resultfile, "\nnumber of reads performed %i", read_performed);
     fprintf(resultfile, "\ncreate marker %i", create_marker);
+    fprintf(resultfile, "\nnum snapshots opened %i", num_snapshots_opened);
     fprintf(resultfile, "\n");
 }
 
@@ -495,14 +570,17 @@ int main(int argc, char* args[])
     // out of a hundred, the distribution of the CUD ops.
     int create_ratio = iniparser_getint(cfg, (char*)"workload:creates", 1);
     int update_ratio = iniparser_getint(cfg, (char*)"workload:updates", 98);
-    // delete ratio becomes symbolic. Helps checks user input.
+    // delete ratio not really required because CUD adds up to 100, but this helps checks configuration file.
     int delete_ratio = iniparser_getint(cfg, (char*)"workload:deletes", 1);
     assert(create_ratio + update_ratio + delete_ratio == 100);
+    // used to determine what KV op to run later.
     create_draw = create_ratio;
     update_draw = create_draw + update_ratio;
 
-    incr_commit_interval_ms = iniparser_getint(cfg, (char*)"workload:incr_commit_interval_ms", 200);
+    incr_inmem_snapshot_interval_ms = iniparser_getint(cfg, (char*)"workload:incr_inmem_snapshot_interval_ms", 500);
+    incr_commit_interval_ms = iniparser_getint(cfg, (char*)"workload:incr_commit_interval_ms", 500);
     incr_compaction_interval = iniparser_getint(cfg, (char*)"workload:incr_compaction_interval", 10);
+    iter_reads_batch_size = iniparser_getint(cfg, (char*)"workload:iter_reads_batch_size", 1000);
 
     read_batch  = iniparser_getint(cfg, (char*)"workload:iter_read_batch_size", 1000);
     buffercachesizeMB = iniparser_getint(cfg, (char*)"db_config:buffercachesizeMB", 1024);
@@ -519,7 +597,9 @@ int main(int argc, char* args[])
 
     //initialize DB and KV instances
     assert(init_fdb_with_kvs() == true);
-    assert(pthread_mutex_init(&snapshot_lock, NULL) == 0);
+
+    //initialize locks
+    assert(pthread_mutex_init(&inmem_lock, NULL) == 0);
 
     //initialize random generator
     //srand (time(NULL));
