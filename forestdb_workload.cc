@@ -1,9 +1,14 @@
 /*
-Notes
+[ Notes ]
+
+12/16/2015 dkao:
+* No locks are put around writing/reading integers. But typically only one
+* writer for all shared static integers.
 
 12/2/2015 dkao:
-* What's the commit frequency during incremental phase?
-* Remember to set buffer cache. Also introduce WAL SIZE when setting forestdb
+* What's the commit frequency during incremental phase?  Remember to set buffer
+* cache. Also introduce WAL SIZE when setting forestdb
+
 */
 
 #include <assert.h>
@@ -41,15 +46,19 @@ const size_t field_value_len = 50;
 pthread_mutex_t persist_lock;
 // Synchronize inmemory snapshot creation and reading
 pthread_mutex_t inmem_lock;
+// Synchronize close of file handle between incrmental writer thread and reader thread
+pthread_mutex_t file_handle_lock;
 // store open in memory snapshots
 static std::deque<fdb_kvs_handle *> inmem_snapshots;
 
 // control points
 static bool incrindexbuilddone = false;
+static int num_incr_mutations = 0;
 static int create_draw = 0;
 static int update_draw = 0;
 static int create_performed = 0;
 static int update_performed = 0;
+static int read_count = 0;
 static int read_performed = 0;
 static int create_marker = 0;
 static int delete_marker = 0;
@@ -70,7 +79,7 @@ void wrap_fdb_get(fdb_kvs_handle * handle, fdb_doc * doc){
     
     fdb_status status;
     status = fdb_get(handle, doc);
-    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 1){
+    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 3){
         printf("fdb_get:");
         fwrite(doc->key, doc->keylen, 1, stdout);
         printf("\n");
@@ -87,7 +96,7 @@ void wrap_fdb_set(fdb_kvs_handle * handle, fdb_doc * doc){
 
     fdb_status status;
     status = fdb_set(handle, doc);
-    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 1){
+    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 3){
         printf("fdb_set:");
         fwrite(doc->key, doc->keylen, 1, stdout);
         printf("\n");
@@ -104,7 +113,7 @@ void wrap_fdb_del(fdb_kvs_handle * handle, fdb_doc * doc){
 
     fdb_status status;
     status = fdb_del(handle, doc);
-    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 1){
+    if (status != FDB_RESULT_SUCCESS or LOG_LEVEL >= 3){
         printf("fdb_del:");
         fwrite(doc->key, doc->keylen, 1, stdout);
         printf("\n");
@@ -273,6 +282,7 @@ void* do_incremental_mutations(void*)
     fdb_kvs_handle *main_handle;
     fdb_kvs_handle *back_handle;
     fdb_kvs_handle *snapshot;
+    fdb_kvs_handle *snapshot_clone;
     fdb_config config;
     fdb_kvs_config kvs_config;
     fdb_doc *main_doc, *back_doc;
@@ -318,13 +328,12 @@ void* do_incremental_mutations(void*)
     commit_checkpoint = clock();
     inmem_snapshot_checkpoint = clock();
     gettimeofday(&index_starttime, NULL);
-    int num_ops = 0;
     create_marker = numinitdocs;
     int update_marker = 0;
 
     int which_op = 0;
     setbuf(stdout, NULL);
-    while(num_ops < num_incr_ops){
+    while(num_incr_mutations < num_incr_ops){
         which_op = rand() % 100;
         if (which_op < create_draw){
             if (LOG_LEVEL >= 2) printf( "create op\n");
@@ -390,13 +399,17 @@ void* do_incremental_mutations(void*)
 
             delete_marker++;
         }
-        num_ops++;
+        num_incr_mutations++;
 
         // open in-memory snapshot every X miliseconds
         if(((clock() - inmem_snapshot_checkpoint) * 1000 /(double) CLOCKS_PER_SEC) > incr_inmem_snapshot_interval_ms){
             status = fdb_snapshot_open(main_handle, &snapshot, FDB_SNAPSHOT_INMEM); 
             assert(status == FDB_RESULT_SUCCESS);
+            ///status = fdb_snapshot_open(snapshot, &snapshot_clone, FDB_SNAPSHOT_INMEM); 
+            ///assert(status == FDB_RESULT_SUCCESS);
+
             pthread_mutex_lock(&inmem_lock);
+            ///inmem_snapshots.push_front(snapshot_clone);
             inmem_snapshots.push_front(snapshot);
             pthread_mutex_unlock(&inmem_lock);
             num_snapshots_opened++;
@@ -408,7 +421,6 @@ void* do_incremental_mutations(void*)
            status = fdb_commit(fhandle, FDB_COMMIT_MANUAL_WAL_FLUSH);
            commit_checkpoint = clock();
         }
-
     } // while loop 
 
     //final commit
@@ -426,9 +438,12 @@ void* do_incremental_mutations(void*)
     fdb_doc_free(back_doc);
     fdb_kvs_close(main_handle);
     fdb_kvs_close(back_handle);
-    fdb_close(fhandle);
 
     incrindexbuilddone = true;
+
+    pthread_mutex_lock(&file_handle_lock);
+    fdb_close(fhandle);
+
 }
 
 
@@ -446,7 +461,6 @@ void* do_compact(void*)
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
     assert(status == FDB_RESULT_SUCCESS);
 
-    if (LOG_LEVEL >= 2) printf("compactor starting");
     fprintf(resultfile, "compactor thread has started\n");
 
     int compact_num = 0;
@@ -493,11 +507,15 @@ void* do_read(void*)
     fdb_doc *doc = NULL;
     fdb_status status;
     fdb_iterator *itr_key;
-    int read_count = 0;
 
     while(!incrindexbuilddone){
+        if (read_performed > num_incr_mutations) continue;
+
         pthread_mutex_lock(&inmem_lock);
-        if (inmem_snapshots.size() == 0) continue;
+        if (inmem_snapshots.size() == 0){
+            pthread_mutex_unlock(&inmem_lock);
+            continue;
+        }
         while(inmem_snapshots.size()>5){
             snapshot = inmem_snapshots.back();
             inmem_snapshots.pop_back();
@@ -519,28 +537,52 @@ void* do_read(void*)
                 break;
             }
             fdb_doc_free(doc);
+            doc = NULL;
             read_count++;
             read_performed++;
         } while(read_count < iter_reads_batch_size and fdb_iterator_next(itr_key) != FDB_RESULT_ITERATOR_FAIL);
         status = fdb_iterator_close(itr_key);
+        itr_key = NULL;
         assert(status == FDB_RESULT_SUCCESS);
     }
+
+    pthread_mutex_unlock(&file_handle_lock);
 }
+
+void* do_periodic_stats(void *)
+{
+    while(!incrindexbuilddone){
+        sleep(2);
+        printf("\nnumber of creates performed %i", create_performed);
+        printf("\nnumber of updates performed %i", update_performed);
+        printf("\nnumber of deletes performed %i", delete_marker);
+        printf("\nnumber of reads performed %i", read_performed);
+        printf("\ncreate marker %i", create_marker);
+        printf("\nnum snapshots opened %i", num_snapshots_opened);
+        printf("\n");
+    }
+}
+
 void do_incremental_load()
 {
 
     printf("Incrmental build phase started\n");
 
-    pthread_t incr_threads[3];
+    pthread_t incr_threads[4];
     pthread_create(&incr_threads[0], NULL, do_incremental_mutations, NULL);
 
+    // block incrmental thread, to be unlocked by reader thread
+    pthread_mutex_lock(&file_handle_lock);
     // also start compactor thread here
     pthread_create(&incr_threads[1], NULL, do_compact, NULL);
 
     // start reader thread
     pthread_create(&incr_threads[2], NULL, do_read, NULL);
 
-    for (int i = 0; i<3; i++){
+    // start periodic stats
+    pthread_create(&incr_threads[3], NULL, do_periodic_stats, NULL);
+
+    for (int i = 0; i<4; i++){
         pthread_join(incr_threads[i], NULL);
     }
 
