@@ -19,4 +19,5 @@ forestdb_standalone_test: $(OBJ)
 clean:
 	rm -f incrementalsecondary.txt forestdb_standalone_test
 	rm -rf data/
+	mkdir -p data
 

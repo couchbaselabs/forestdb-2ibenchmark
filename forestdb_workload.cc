@@ -28,7 +28,6 @@
 // from config
 static int numinitdocs;
 static int num_incr_ops;
-static int read_batch;
 static int lock_prob;
 static int buffercachesizeMB;
 static int incr_commit_interval_ms = 0;
@@ -146,7 +145,8 @@ int init_fdb_with_kvs()
     config.max_writer_lock_prob = lock_prob;
     config.durability_opt = FDB_DRB_ASYNC;
     config.compaction_mode = FDB_COMPACTION_MANUAL;
-    config.buffercache_size = (uint64_t)buffercachesizeMB*1024*1024;  //1024MB
+    config.buffercache_size = (uint64_t)buffercachesizeMB*1024*1024;//default 30*1GB
+    config.wal_threshold = (uint64_t) wal_size;
     kvs_config = fdb_get_default_kvs_config();
 
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
@@ -180,6 +180,7 @@ void* do_initial_write(void*)
     config = fdb_get_default_config();
     config.max_writer_lock_prob = lock_prob;
     config.durability_opt = FDB_DRB_ASYNC;
+    config.wal_threshold = (uint64_t) wal_size;
 
     kvs_config = fdb_get_default_kvs_config();
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
@@ -295,6 +296,7 @@ void* do_incremental_mutations(void*)
     config = fdb_get_default_config();
     config.max_writer_lock_prob = lock_prob;
     config.durability_opt = FDB_DRB_ASYNC;
+    config.wal_threshold = (uint64_t) wal_size;
 
     kvs_config = fdb_get_default_kvs_config();
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
@@ -458,6 +460,7 @@ void* do_compact(void*)
     
     config = fdb_get_default_config();
     config.compaction_mode = FDB_COMPACTION_MANUAL;
+    config.wal_threshold = (uint64_t) wal_size;
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
     assert(status == FDB_RESULT_SUCCESS);
 
@@ -624,16 +627,17 @@ int main(int argc, char* args[])
     incr_compaction_interval = iniparser_getint(cfg, (char*)"workload:incr_compaction_interval", 10);
     iter_reads_batch_size = iniparser_getint(cfg, (char*)"workload:iter_reads_batch_size", 1000);
 
-    read_batch  = iniparser_getint(cfg, (char*)"workload:iter_read_batch_size", 1000);
+    //db_config
     buffercachesizeMB = iniparser_getint(cfg, (char*)"db_config:buffercachesizeMB", 1024);
+    wal_size = iniparser_getint(cfg, (char*)"db_config:wal_size", 40960);
     const char *resultfilename = (const char*) iniparser_getstring(cfg, (char*)"general:resultfilename",
                                                                    (char*)"initialsecondary");
-    lock_prob = iniparser_getint(cfg, (char*)"db_config:lock_prob", 100);
+    lock_prob = iniparser_getint(cfg, (char*)"db_config:lock_prob", 30);
 
     resultfile = fopen(resultfilename, "a");
     fprintf(resultfile, "\nNumber of intended initial documents: %d", numinitdocs);
     fprintf(resultfile, "\nNumber of intended ops during incremental phase: %d", num_incr_ops);
-    fprintf(resultfile, "\nHow many iterator reads before moving the start key: %d", read_batch);
+    fprintf(resultfile, "\nHow many iterator reads before moving the start key: %d", iter_reads_batch_size);
     fprintf(resultfile, "\nSize of buffer cache: %d MB", buffercachesizeMB);
     fprintf(resultfile, "\n");
 
