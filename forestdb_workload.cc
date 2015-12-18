@@ -30,6 +30,7 @@ static int numinitdocs;
 static int num_incr_ops;
 static int lock_prob;
 static int buffercachesizeMB;
+static int wal_size;
 static int incr_commit_interval_ms = 0;
 static int incr_compaction_interval = 0;
 static int incr_inmem_snapshot_interval_ms = 0;
