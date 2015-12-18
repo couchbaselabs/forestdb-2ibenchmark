@@ -12,6 +12,7 @@
 */
 
 #include <assert.h>
+#include <execinfo.h>
 #include <deque>
 #include <unistd.h>
 #include <stdio.h>
@@ -68,6 +69,26 @@ static int LOG_LEVEL = 0;
 // STATS
 static int num_snapshots_opened = 0;
 
+void print_call_stack(){
+    const int MAX_FRAMES = 128;
+    void* callstack[MAX_FRAMES];
+    int num_frames = backtrace(callstack, MAX_FRAMES);
+    char** strs = backtrace_symbols(callstack, num_frames);
+    for (int i = 0; i < num_frames; i++){
+        printf("%s\n", strs[i]);
+    }
+    free(strs);
+}
+
+/*
+ * Prints stack trace before an assert that is about to fail.
+ */
+void passert(bool boolean)
+{
+    if (boolean) return;
+    print_call_stack();
+    assert(boolean);
+}
 /* To reuse fdb_doc and preserve the flags and other meta data after an initial
  * fdb_doc_create, make sure you always use these wrap_fdb_* calls which saves
  * the previous state. The fdb_doc's non-pointer values should be kept the same
@@ -84,8 +105,8 @@ void wrap_fdb_get(fdb_kvs_handle * handle, fdb_doc * doc){
         fwrite(doc->key, doc->keylen, 1, stdout);
         printf("\n");
     }
-    status == 0 ? : printf("\nget status %i\n", status);
-    assert(status == FDB_RESULT_SUCCESS);
+    if (status != 0) printf("\nget status %i\n", status);
+    passert(status == FDB_RESULT_SUCCESS);
 
     *doc = doc_backup;
 }
@@ -101,8 +122,8 @@ void wrap_fdb_set(fdb_kvs_handle * handle, fdb_doc * doc){
         fwrite(doc->key, doc->keylen, 1, stdout);
         printf("\n");
     }
-    status == 0 ? : printf("\nset status %i\n", status);
-    assert(status == FDB_RESULT_SUCCESS);
+    if (status != 0) printf("\nset status %i\n", status);
+    passert(status == FDB_RESULT_SUCCESS);
 
     *doc = doc_backup;
 }
@@ -118,8 +139,8 @@ void wrap_fdb_del(fdb_kvs_handle * handle, fdb_doc * doc){
         fwrite(doc->key, doc->keylen, 1, stdout);
         printf("\n");
     }
-    status == 0 ? : printf("\ndel status %i\n", status);
-    assert(status == FDB_RESULT_SUCCESS);
+    if (status != 0) printf("\ndel status %i\n", status);
+    passert(status == FDB_RESULT_SUCCESS);
 
     *doc = doc_backup;
 }
@@ -151,13 +172,13 @@ int init_fdb_with_kvs()
     kvs_config = fdb_get_default_kvs_config();
 
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     status = fdb_kvs_open(fhandle, &main_handle,"main" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     status = fdb_kvs_open(fhandle, &back_handle,"back" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     fdb_kvs_close(main_handle);
     fdb_kvs_close(back_handle);
@@ -185,11 +206,11 @@ void* do_initial_write(void*)
 
     kvs_config = fdb_get_default_kvs_config();
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open(fhandle, &main_handle,"main" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open(fhandle, &back_handle,"back" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     /*
      * Main index is a covering index that concatenates field value and docid
@@ -205,10 +226,10 @@ void* do_initial_write(void*)
 
     status = fdb_doc_create(&main_doc, (const void *)main_key_buf, (docid_len + field_value_len),
                                NULL, 0, NULL, 0);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
     status = fdb_doc_create(&back_doc, (const void *)back_key_buf, docid_len,
                                NULL, 0, (const void *)back_value_buf, field_value_len);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     //start commit clock
     commit_checkpoint = clock();
@@ -246,7 +267,7 @@ void* do_initial_write(void*)
             numinitdocswritten, (index_stoptime.tv_sec-index_starttime.tv_sec));
 
     status = fdb_compact(fhandle, NULL);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     free(main_key_buf);
     free(back_key_buf);
@@ -301,11 +322,11 @@ void* do_incremental_mutations(void*)
 
     kvs_config = fdb_get_default_kvs_config();
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open(fhandle, &main_handle,"main" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
     status = fdb_kvs_open(fhandle, &back_handle,"back" , &kvs_config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     /*
      * Main index is a covering index that concatenates field value and docid
@@ -322,10 +343,10 @@ void* do_incremental_mutations(void*)
 
     status = fdb_doc_create(&main_doc, (const void *)main_key_buf, (docid_len + field_value_len),
                                NULL, 0, NULL, 0);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
     status = fdb_doc_create(&back_doc, (const void *)back_key_buf, docid_len,
                                NULL, 0, (const void *)back_value_buf, field_value_len);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     //start commit clock
     commit_checkpoint = clock();
@@ -407,9 +428,9 @@ void* do_incremental_mutations(void*)
         // open in-memory snapshot every X miliseconds
         if(((clock() - inmem_snapshot_checkpoint) * 1000 /(double) CLOCKS_PER_SEC) > incr_inmem_snapshot_interval_ms){
             status = fdb_snapshot_open(main_handle, &snapshot, FDB_SNAPSHOT_INMEM); 
-            assert(status == FDB_RESULT_SUCCESS);
+            passert(status == FDB_RESULT_SUCCESS);
             ///status = fdb_snapshot_open(snapshot, &snapshot_clone, FDB_SNAPSHOT_INMEM); 
-            ///assert(status == FDB_RESULT_SUCCESS);
+            ///passert(status == FDB_RESULT_SUCCESS);
 
             pthread_mutex_lock(&inmem_lock);
             ///inmem_snapshots.push_front(snapshot_clone);
@@ -463,7 +484,7 @@ void* do_compact(void*)
     config.compaction_mode = FDB_COMPACTION_MANUAL;
     config.wal_threshold = (uint64_t) wal_size;
     status = fdb_open(&fhandle, "data/secondaryDB", &config);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     fprintf(resultfile, "compactor thread has started\n");
 
@@ -474,7 +495,7 @@ void* do_compact(void*)
 
         //keep at least last five of markers when possible.
         status = fdb_get_all_snap_markers(fhandle, &markers, &num_markers);
-        assert(status == FDB_RESULT_SUCCESS);
+        passert(status == FDB_RESULT_SUCCESS);
         if (num_markers > 5){
             upto = 4;
         } else {
@@ -483,8 +504,8 @@ void* do_compact(void*)
         gettimeofday(&compact_starttime, NULL);
         status = fdb_compact_upto(fhandle, NULL, markers[upto].marker);
         gettimeofday(&compact_stoptime, NULL);
-        assert(status == FDB_RESULT_SUCCESS);
-        assert(fdb_free_snap_markers(markers, num_markers) == FDB_RESULT_SUCCESS);
+        passert(status == FDB_RESULT_SUCCESS);
+        passert(fdb_free_snap_markers(markers, num_markers) == FDB_RESULT_SUCCESS);
 
         compact_num++;
         fprintf(resultfile,"Compaction run %d took %lu seconds upto %ju\n", compact_num,
@@ -495,7 +516,7 @@ void* do_compact(void*)
     gettimeofday(&compact_starttime, NULL);
     status = fdb_compact(fhandle, NULL);
     gettimeofday(&compact_stoptime, NULL);
-    assert(status == FDB_RESULT_SUCCESS);
+    passert(status == FDB_RESULT_SUCCESS);
 
     compact_num++;
     fprintf(resultfile,"Compaction run %d took %lu seconds to complete\n", compact_num,
@@ -533,7 +554,7 @@ void* do_read(void*)
                     NULL, 0,
                     NULL, 0,
                     FDB_ITR_NO_DELETES);
-        assert(status == FDB_RESULT_SUCCESS);
+        passert(status == FDB_RESULT_SUCCESS);
         read_count = 0;
         do {
             status = fdb_iterator_get(itr_key, &doc);
@@ -547,7 +568,7 @@ void* do_read(void*)
         } while(read_count < iter_reads_batch_size and fdb_iterator_next(itr_key) != FDB_RESULT_ITERATOR_FAIL);
         status = fdb_iterator_close(itr_key);
         itr_key = NULL;
-        assert(status == FDB_RESULT_SUCCESS);
+        passert(status == FDB_RESULT_SUCCESS);
     }
 
     pthread_mutex_unlock(&file_handle_lock);
@@ -602,7 +623,7 @@ void do_incremental_load()
 uint64_t get_filesize(const char *filename)
 {
     struct stat filestat;
-    assert(stat(filename, &filestat) == 0);
+    passert(stat(filename, &filestat) == 0);
     return filestat.st_size;
 }
 
@@ -618,7 +639,7 @@ int main(int argc, char* args[])
     int update_ratio = iniparser_getint(cfg, (char*)"workload:updates", 98);
     // delete ratio not really required because CUD adds up to 100, but this helps checks configuration file.
     int delete_ratio = iniparser_getint(cfg, (char*)"workload:deletes", 1);
-    assert(create_ratio + update_ratio + delete_ratio == 100);
+    passert(create_ratio + update_ratio + delete_ratio == 100);
     // used to determine what KV op to run later.
     create_draw = create_ratio;
     update_draw = create_draw + update_ratio;
@@ -643,10 +664,10 @@ int main(int argc, char* args[])
     fprintf(resultfile, "\n");
 
     //initialize DB and KV instances
-    assert(init_fdb_with_kvs() == true);
+    passert(init_fdb_with_kvs() == true);
 
     //initialize locks
-    assert(pthread_mutex_init(&inmem_lock, NULL) == 0);
+    passert(pthread_mutex_init(&inmem_lock, NULL) == 0);
 
     //initialize random generator
     //srand (time(NULL));
