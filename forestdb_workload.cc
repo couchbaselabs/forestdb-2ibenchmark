@@ -65,7 +65,7 @@ static int read_performed = 0;
 static int create_marker = 0;
 static int delete_marker = 0;
 
-static int LOG_LEVEL = 0;
+static int LOG_LEVEL = 2;
 
 // STATS
 static int num_snapshots_opened = 0;
