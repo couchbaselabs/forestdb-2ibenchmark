@@ -1,5 +1,5 @@
 CC=g++
-override CFLAGS := -Werror -Iutils/
+override CFLAGS := -g -Werror -Iutils/
 
 FDBFLAGS=-I$(FDBDIR)/include -L$(FDBDIR)/build
 

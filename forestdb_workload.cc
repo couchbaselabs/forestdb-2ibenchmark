@@ -38,6 +38,7 @@ static int incr_inmem_snapshot_interval_ms = 0;
 static int iter_reads_batch_size;
 
 // general
+static char const * this_program_name;
 FILE * resultfile;
 static bool incr_index_build_done = false;
 // This has to be 20. Some hardcoding logic. See fill_key.
@@ -69,13 +70,21 @@ static int LOG_LEVEL = 0;
 // STATS
 static int num_snapshots_opened = 0;
 
+int addr2line(char const * program_name, void * addr)
+{
+    char addr2line_cmd[512];
+    sprintf(addr2line_cmd, "addr2line -f -e %.256s %p", program_name, addr);
+    return system(addr2line_cmd);
+}
+
 void print_call_stack(){
     const int MAX_FRAMES = 128;
     void* callstack[MAX_FRAMES];
     int num_frames = backtrace(callstack, MAX_FRAMES);
     char** strs = backtrace_symbols(callstack, num_frames);
+
     for (int i = 0; i < num_frames; i++){
-        printf("%s\n", strs[i]);
+        addr2line(this_program_name, callstack[i]);    
     }
     free(strs);
 }
@@ -629,6 +638,8 @@ uint64_t get_filesize(const char *filename)
 
 int main(int argc, char* args[])
 {
+    this_program_name = args[0];
+
     // get config
     dictionary *cfg = iniparser_new((char*) "./bench_config.ini");
     numinitdocs = iniparser_getint(cfg, (char*)"workload:numinitdocs", 1000000);
