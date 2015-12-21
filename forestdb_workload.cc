@@ -41,8 +41,8 @@ static int iter_reads_batch_size;
 static char const * this_program_name;
 FILE * resultfile;
 static bool incr_index_build_done = false;
-// This has to be 20. Some hardcoding logic. See fill_key.
-const size_t docid_len = 20;
+// See fill_key for docid_len construction.
+const size_t docid_len = 34;
 const size_t field_value_len = 50;
 //persist_lock needed if we open persisted snapshot for reading
 pthread_mutex_t persist_lock;
@@ -65,7 +65,7 @@ static int read_performed = 0;
 static int create_marker = 0;
 static int delete_marker = 0;
 
-static int LOG_LEVEL = 2;
+static int LOG_LEVEL = 0;
 
 // STATS
 static int num_snapshots_opened = 0;
@@ -156,10 +156,11 @@ void wrap_fdb_del(fdb_kvs_handle * handle, fdb_doc * doc){
 
 void fill_key(char* buffer, unsigned long long marker){
     //hash the marker and fill the result into buffer.
-    const char *prefix = "secidx";
+    const char *prefix = "docid";
     sprintf(buffer, "%s", prefix);
-    sprintf(buffer+6, "%014d", XXH64(&marker, sizeof(marker), 1));
-    //fwrite(buffer, 20, 1, stdout);
+    sprintf(buffer+5, "%014llu", XXH64(&marker, sizeof(marker), 1));
+    sprintf(buffer+5+14, "-%014llu", marker);
+    //fwrite(buffer, docid_len, 1, stdout);
     //printf(" fill key marker %i\n", marker);
 }
 
