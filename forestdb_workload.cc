@@ -483,6 +483,11 @@ void* do_incremental_mutations(void*)
 
 void* do_compact(void*)
 {
+    if (incr_compaction_interval < 0){
+        printf("Skipping periodic compaction\n");
+        return NULL;
+    }
+    printf("periodic compaction every %i seconds\n", incr_compaction_interval);
     fdb_file_handle *fhandle;
     fdb_status status;
     fdb_config config;
